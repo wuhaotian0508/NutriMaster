@@ -21,14 +21,28 @@ from nutrimaster.experiment import ExperimentDesignService
 
 
 class ExperimentDesignTool(BaseTool):
+    """实验设计工具，提供一键式 CRISPR 靶点设计和实验方案生成功能。
+
+    封装 ExperimentDesignService，支持解析基因/物种信息、生成实验建议或完整 SOP。
+    """
     name = "experiment_design"
     description = "一键实验设计工具：解析基因/物种，进行 CRISPR 靶点设计并生成实验建议或完整 SOP"
 
     def __init__(self, service: ExperimentDesignService):
+        """初始化实验设计工具。
+
+        参数:
+            service: 实验设计服务实例，提供底层的实验设计和 CRISPR 分析功能。
+        """
         self.service = service
 
     @property
     def schema(self) -> dict:
+        """获取实验设计工具的 OpenAI 兼容函数调用 schema。
+
+        返回:
+            dict: 包含 goal（必填）、genes、output、confirmed 参数的 schema 定义。
+        """
         return {
             "type": "function",
             "function": {
@@ -76,6 +90,18 @@ class ExperimentDesignTool(BaseTool):
         confirmed: bool = False,
         **_,
     ) -> str:
+        """执行实验设计工具，生成实验建议或完整 SOP。
+
+        参数:
+            goal: 用户的实验目标或原始需求描述。
+            genes: 可选的已知基因列表，每项包含 gene 和 species 字段。
+            output: 输出类型，"advice" 返回实验建议，"full_sop" 生成完整 SOP。
+            confirmed: 是否确认运行完整 pipeline，未确认时只返回预览。
+            **_: 忽略的额外参数。
+
+        返回:
+            str: 实验建议文本或完整 SOP 文本。
+        """
         return await self.service.tool_call(
             goal=goal,
             genes=genes,

@@ -122,6 +122,35 @@
                     <div class="stat-desc">Processed .md in archive</div>
                 </div>
             </div>
+
+            <!-- RAG Index Status Card -->
+            <div class="index-status-card">
+                <div class="index-status-header">
+                    <h3>📊 RAG Index Status</h3>
+                    <button class="btn-ghost-sm" onclick="refreshIndexStatus()">Refresh</button>
+                </div>
+                <div class="index-stats">
+                    <div class="index-stat-row">
+                        <span class="index-label">Indexed Files:</span>
+                        <span id="index-files" class="index-value">-- / --</span>
+                    </div>
+                    <div class="index-stat-row">
+                        <span class="index-label">Total Chunks:</span>
+                        <span id="index-chunks" class="index-value">--</span>
+                    </div>
+                    <div class="index-stat-row">
+                        <span class="index-label">Last Updated:</span>
+                        <span id="index-updated" class="index-value">--</span>
+                    </div>
+                    <div class="index-stat-row">
+                        <span class="index-label">Status:</span>
+                        <span id="index-status" class="badge">--</span>
+                    </div>
+                </div>
+                <button id="rebuild-index-btn" class="btn-secondary" onclick="rebuildIndex()">
+                    🔄 Rebuild Index
+                </button>
+            </div>
             <div id="pipeline-status-banner" class="status-banner" style="display:none">
                 <span class="pulse"></span>
                 <span id="pipeline-status-text">Pipeline running...</span>

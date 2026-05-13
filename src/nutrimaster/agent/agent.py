@@ -14,9 +14,17 @@ MAX_STEPS = 12
 
 
 class Agent:
-    """Small LLM tool loop over high-level NutriMaster tools."""
+    """基于 LLM 的工具调用循环代理，用于协调 NutriMaster 高级工具的调用与交互。"""
 
     def __init__(self, registry, skill_loader, call_llm, prompt_builder: PromptBuilder | None = None):
+        """初始化 Agent 实例。
+
+        参数:
+            registry: 工具注册表，管理可用的工具集合。
+            skill_loader: 技能加载器，用于加载共享和用户自定义技能。
+            call_llm: 异步回调函数，用于调用 LLM 模型生成回复。
+            prompt_builder: 提示词构建器，为 None 时使用默认的 PromptBuilder。
+        """
         self.registry = registry
         self.loader = skill_loader
         self.call_llm = call_llm
@@ -24,6 +32,15 @@ class Agent:
 
     @staticmethod
     def _msg_to_dict(msg, model_id: str = "") -> dict:
+        """将 LLM 返回的消息对象转换为标准字典格式。
+
+        参数:
+            msg: LLM 返回的消息对象，支持 Pydantic 模型、字典或带属性的对象。
+            model_id: 模型标识符（当前未使用，保留扩展）。
+
+        返回:
+            dict: 包含 role、content 等字段的标准消息字典。
+        """
         if hasattr(msg, "model_dump"):
             data = msg.model_dump(exclude_none=True)
         elif isinstance(msg, dict):
@@ -39,6 +56,15 @@ class Agent:
 
     @staticmethod
     def _truncate_history(history: list, max_chars_per_msg: int = 800) -> list:
+        """截断历史消息中过长的助手回复，防止上下文窗口溢出。
+
+        参数:
+            history: 历史消息列表，每个元素为包含 role 和 content 的字典。
+            max_chars_per_msg: 每条助手消息的最大字符数，超出部分将被截断。
+
+        返回:
+            list: 截断处理后的消息列表。
+        """
         truncated = []
         for msg in history or []:
             content = msg.get("content", "")
@@ -50,6 +76,14 @@ class Agent:
 
     @staticmethod
     def _strip_reasoning_for_new_turn(messages: list[dict]) -> list[dict]:
+        """移除助手消息中的 reasoning_content 字段，避免在新一轮对话中发送推理内容。
+
+        参数:
+            messages: 消息列表，每个元素为包含角色和内容的字典。
+
+        返回:
+            list[dict]: 移除 reasoning_content 后的消息列表。
+        """
         output = []
         for msg in messages:
             if msg.get("role") == "assistant" and "reasoning_content" in msg:
@@ -60,6 +94,18 @@ class Agent:
 
     @staticmethod
     def _filter_citations(answer_text: str, evidence_packets: list[EvidencePacket]) -> list[dict]:
+        """根据回答文本中实际引用的编号，过滤出被引用的文献条目。
+
+        如果回答文本中包含 [数字] 形式的引用，则只保留被引用的文献；
+        如果没有检测到引用编号，则返回所有文献。
+
+        参数:
+            answer_text: 代理生成的回答文本。
+            evidence_packets: 证据包列表，包含 RAG 检索返回的文献引用。
+
+        返回:
+            list[dict]: 过滤后的文献引用列表。
+        """
         citations = Agent._unique_citations(
             citation
             for packet in evidence_packets
@@ -82,6 +128,14 @@ class Agent:
 
     @staticmethod
     def _unique_citations(citations) -> list[dict]:
+        """对文献引用列表进行去重，基于标题、DOI、PMID 或 URL 作为唯一性标识。
+
+        参数:
+            citations: 可迭代的文献引用字典集合。
+
+        返回:
+            list[dict]: 去重后的文献引用列表。
+        """
         output = []
         seen: set[tuple[str, str]] = set()
         for citation in citations:
@@ -101,6 +155,16 @@ class Agent:
 
     @staticmethod
     def _get_value(obj, key: str, default=None):
+        """从字典或对象中安全获取指定键/属性的值。
+
+        参数:
+            obj: 目标字典或对象。
+            key: 要获取的键名或属性名。
+            default: 键/属性不存在时返回的默认值。
+
+        返回:
+            键/属性对应的值，不存在时返回 default。
+        """
         if isinstance(obj, dict):
             return obj.get(key, default)
         return getattr(obj, key, default)
@@ -116,6 +180,26 @@ class Agent:
         skill_prefs: dict | None = None,
         tool_overrides: dict | None = None,
     ):
+        """执行代理的主循环，处理用户输入并通过工具调用生成回答。
+
+        这是一个异步生成器方法，会依次 yield 各种事件（工具调用、文本、引用、错误等）。
+        代理会在最多 MAX_STEPS 步内完成工具调用循环，直到 LLM 不再请求工具为止。
+
+        参数:
+            user_input: 用户输入的查询文本。
+            user_id: 用户标识符，用于个人库检索和技能加载。
+            model_id: 指定使用的 LLM 模型标识符。
+            history: 对话历史消息列表。
+            use_personal: 是否启用个人知识库检索。
+            use_depth: 是否启用深度搜索模式。
+            skill_prefs: 技能偏好配置（当前保留扩展）。
+            tool_overrides: 工具覆盖配置（当前保留扩展）。
+
+        生成(yields):
+            dict: 包含 type 字段的事件字典，type 可为 tools_enabled、thinking、
+                  text、tool_call、tool_result、citations、sources、genes_available、
+                  done 或 error。
+        """
         try:
             yield {"type": "tools_enabled", "tools": sorted(self.registry.tool_names)}
             messages = [

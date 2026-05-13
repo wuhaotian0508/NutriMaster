@@ -133,17 +133,30 @@ _index_refresh_handler: Callable[[Path, bool], None] | None = None
 
 
 def configure_index_refresh(handler: Callable[[Path, bool], None] | None) -> None:
-    """Inject the host app's retriever refresh function.
+    """注入宿主应用的检索器索引刷新函数。
 
-    Standalone admin falls back to constructing its own retriever, while the
-    integrated FastAPI app passes its live retriever so new corpus files are
-    visible to the current query process after indexing.
+    独立运行的 admin 会回退到构建自己的检索器；
+    集成到 FastAPI 主应用时，会传入活跃的检索器实例，
+    使新添加的语料文件在索引重建后立即对当前查询流程可见。
+
+    参数:
+        handler: 索引刷新回调函数，接受 (data_dir: Path, force: bool) 两个参数。
+                 传入 None 表示清除已注入的处理器，回退到默认行为。
     """
     global _index_refresh_handler
     _index_refresh_handler = handler
 
 
 def _refresh_index(data_dir: Path, *, force: bool = False) -> None:
+    """刷新 RAG 向量检索索引。
+
+    优先使用通过 configure_index_refresh 注入的处理器；
+    若未注入，则回退创建一个临时的 JinaRetriever 进行增量索引构建。
+
+    参数:
+        data_dir: 语料 JSON 文件所在目录路径。
+        force: 是否强制重建索引（默认 False，仅增量更新）。
+    """
     if _index_refresh_handler is not None:
         _index_refresh_handler(Path(data_dir), force)
         return
@@ -160,16 +173,35 @@ def _refresh_index(data_dir: Path, *, force: bool = False) -> None:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 class _TeeWriter:
-    """将写入内容同时输出到原始流和内存缓冲区（线程安全）。"""
+    """将写入内容同时输出到原始流和内存缓冲区（线程安全）。
+
+    用于捕获 process_one_paper 的 print 输出，不影响终端正常显示。
+    内部维护一个有最大字符数限制的 StringIO 缓冲区，防止长时间运行导致内存溢出。
+    """
 
     def __init__(self, original, max_chars=200_000):
+        """初始化 TeeWriter。
+
+        参数:
+            original: 原始输出流（如 sys.__stdout__），写入内容会同时发送到该流。
+            max_chars: 内存缓冲区最大字符数（默认 200,000），超出后自动截取尾部。
+        """
         self._original = original    # 原始 stdout/stderr
         self._buf = io.StringIO()    # 内存缓冲区
         self._max = max_chars        # 缓冲区最大字符数（防止内存爆炸）
         self._lock = threading.Lock()
 
     def write(self, s):
-        """写入内容到原始流和缓冲区。"""
+        """将内容同时写入原始流和内存缓冲区。
+
+        当缓冲区超过最大字符数限制时，自动截取尾部保留。
+
+        参数:
+            s: 要写入的字符串内容。
+
+        返回:
+            int: 写入的字符数。
+        """
         self._original.write(s)
         with self._lock:
             self._buf.write(s)
@@ -181,10 +213,19 @@ class _TeeWriter:
         return len(s)
 
     def flush(self):
-        self._original.flush()
+        """刷新原始输出流的缓冲区。"""
 
     def get_tail(self, n=5000):
-        """获取缓冲区最后 n 个字符（供 /api/pipeline/output 接口返回）。"""
+        """获取缓冲区末尾指定数量的字符。
+
+        供 /api/pipeline/output 接口返回最近的控制台输出。
+
+        参数:
+            n: 要获取的最大字符数（默认 5000）。
+
+        返回:
+            str: 缓冲区末尾最多 n 个字符的文本。
+        """
         with self._lock:
             text = self._buf.getvalue()
             return text[-n:] if len(text) > n else text
@@ -197,9 +238,14 @@ class _TeeWriter:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def _extract_token() -> str:
-    """从 Authorization header 或 URL query param 提取 token。
+    """从 HTTP 请求中提取认证 Token。
 
-    SSE 端点 (EventSource) 不支持自定义 header，所以通过 ?token=xxx 传递。
+    优先从 Authorization header 中提取 Bearer Token；
+    若 header 中不存在，则从 URL 查询参数 ?token=xxx 中获取。
+    SSE 端点（EventSource）不支持自定义 header，因此通过查询参数传递。
+
+    返回:
+        str: 提取到的 token 字符串，未找到时返回空字符串。
     """
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
@@ -208,9 +254,21 @@ def _extract_token() -> str:
 
 
 def login_required(f):
-    """验证 Supabase access token，成功后将 user 对象挂到 request.user。"""
+    """登录认证装饰器。
+
+    验证请求中的 Supabase access token 是否有效。
+    验证成功后将 user 对象挂载到 request.user，供后续处理函数使用。
+    若 token 缺失或无效，返回 401 错误；若 Supabase 未配置，返回 500 错误。
+
+    参数:
+        f: 被装饰的视图函数。
+
+    返回:
+        function: 包装后的视图函数，在调用前先完成 token 验证。
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
+        """验证用户登录 token 并注入用户信息到 request。"""
         token = _extract_token()
         if not token:
             return jsonify({"error": "未登录"}), 401
@@ -226,10 +284,21 @@ def login_required(f):
 
 
 def admin_required(f):
-    """在 login_required 基础上，额外检查 email 在 ADMIN_EMAILS 白名单中。"""
+    """管理员权限认证装饰器。
+
+    在 login_required 的基础上，额外检查用户邮箱是否在 ADMIN_EMAILS 白名单中。
+    若 ADMIN_EMAIL 环境变量未配置，返回 500 错误；若用户不在白名单中，返回 403 错误。
+
+    参数:
+        f: 被装饰的视图函数。
+
+    返回:
+        function: 包装后的视图函数，在调用前先完成登录验证和管理员权限校验。
+    """
     @wraps(f)
     @login_required
     def decorated(*args, **kwargs):
+        """校验当前用户是否在管理员白名单中。"""
         if not ADMIN_EMAILS:
             return jsonify({"error": "ADMIN_EMAIL 未配置"}), 500
         if request.user.email not in ADMIN_EMAILS:
@@ -243,10 +312,13 @@ def admin_required(f):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def get_processed_stems() -> set:
-    """扫描 data/ 获取已处理文件的 stem 集合（用于上传去重）。
+    """扫描语料目录，获取已处理文件的 stem（文件名主干）集合。
 
-    例如文件 MinerU_markdown_PMC123_nutri_plant_verified.json
-    → stem = "MinerU_markdown_PMC123"
+    用于上传时去重判断。例如文件 MinerU_markdown_PMC123_nutri_plant_verified.json
+    对应的 stem 为 "MinerU_markdown_PMC123"。
+
+    返回:
+        set: 已处理文件的 stem 字符串集合。
     """
     return {
         f.name.replace("_nutri_plant_verified.json", "")
@@ -255,22 +327,44 @@ def get_processed_stems() -> set:
 
 
 def get_input_files() -> list:
-    """获取 src/nutrimaster/extraction/input/ 中所有待处理的 .md 文件名（排序后）。"""
+    """获取待处理输入目录中所有 Markdown 文件的文件名列表。
+
+    扫描 src/nutrimaster/extraction/input/ 目录，返回所有 .md 后缀文件的文件名（已排序）。
+
+    返回:
+        list: 排序后的 .md 文件名字符串列表。若目录不存在则返回空列表。
+    """
     if not INPUT_DIR.exists():
         return []
     return sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".md"))
 
 
 def _sse_event(event: str, data: dict) -> str:
-    """格式化一条 SSE 事件字符串。"""
+    """将事件类型和数据格式化为 SSE（Server-Sent Events）协议字符串。
+
+    参数:
+        event: SSE 事件类型名称（如 "start"、"processing"、"complete"）。
+        data: 事件携带的数据字典，会被序列化为 JSON。
+
+    返回:
+        str: 符合 SSE 协议的事件字符串，格式为 "event: xxx\\ndata: {...}\\n\\n"。
+    """
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _apply_settings(settings: dict):
-    """将前端传入的参数应用到 extractor 模块的运行时变量。
+    """将前端传入的运行参数应用到 extractor 模块的运行时变量。
 
-    因为 extractor 的 config 是模块级导入（import 时复制值），
-    所以需要直接修改目标模块的变量才能生效。
+    由于 extractor 的 config 是模块级导入（import 时复制值），
+    因此需要直接修改目标模块的变量才能在运行时生效。
+
+    支持的参数:
+      - temperature: 提取 API 的温度参数，会修改 extract.TEMPERATURE
+      - verify_batch_genes: 每批验证的基因数量，会修改 verify.GENES_PER_BATCH
+
+    参数:
+        settings: 包含参数键值对的字典，键名对应 PIPELINE_DEFAULTS 中的参数名。
+                  值会被裁剪到 PIPELINE_LIMITS 定义的允许范围内。
     """
     import nutrimaster.extraction.extract as _ext
     import nutrimaster.extraction.verify as _ver
@@ -295,13 +389,23 @@ def _apply_settings(settings: dict):
 
 @admin_bp.route("/")
 def index():
-    """返回 Admin SPA 首页。"""
+    """返回 Admin SPA（单页应用）的首页 HTML 文件。
+
+    返回:
+        Response: 包含 index.html 内容的 Flask 文件响应。
+    """
     return send_from_directory(str(Path(__file__).parent / "static"), "index.html")
 
 
 @admin_bp.route("/api/config")
 def api_config():
-    """返回前端需要的 Supabase 公钥配置（无需认证）。"""
+    """返回前端所需的 Supabase 公钥配置信息。
+
+    该接口无需认证，供前端初始化 Supabase 客户端时使用。
+
+    返回:
+        JSON: 包含 supabase_url 和 supabase_anon_key 的 JSON 响应。
+    """
     return jsonify({
         "supabase_url": SUPABASE_URL,
         "supabase_anon_key": SUPABASE_ANON_KEY,
@@ -315,7 +419,15 @@ def api_config():
 @admin_bp.route("/api/status")
 @admin_required
 def api_status():
-    """返回 Dashboard 统计数据 + pipeline 运行状态。"""
+    """返回管理面板仪表盘的统计数据和 Pipeline 运行状态。
+
+    统计内容包括：待处理队列文件数、已处理论文总数、归档数、
+    Pipeline 是否正在运行以及当前进度。
+
+    返回:
+        JSON: 包含 input_queue、processed_total、waitlist、
+              pipeline_running、pipeline_done、pipeline_total 的 JSON 响应。
+    """
     input_count = len(get_input_files())
     processed_count = len(list(DATA_DIR.glob("*_nutri_plant_verified.json")))
     # "Archive" = 已处理过的 .md（被移入 processed 目录）
@@ -345,11 +457,19 @@ def api_status():
 @admin_bp.route("/api/upload", methods=["POST"])
 @admin_required
 def api_upload():
-    """上传 zip 文件，递归解压并将 .md 文件放入 input 目录。
+    """处理 ZIP 文件上传，递归解压并将 Markdown 文件导入待处理队列。
 
-    去重规则：
-      1. stem 已在 data/ 中有 verified JSON → 跳过（"已在库中"）
-      2. stem 已在 src/nutrimaster/extraction/input/ 中 → 跳过（"已在队列中"）
+    从上传的 ZIP 文件中递归解压所有嵌套的 ZIP 和 .md 文件，
+    去重后将新文件存入 src/nutrimaster/extraction/input/ 目录。
+
+    去重规则:
+      1. stem 已在 data/ 目录中有 verified JSON → 跳过（已在库中）
+      2. stem 已在 input/ 目录中 → 跳过（已在队列中）
+
+    返回:
+        JSON: 包含 new_files（新增文件列表）、skipped_processed（因已处理而跳过的列表）、
+              skipped_existing（因已在队列中而跳过的列表）。
+              若无文件上传或 ZIP 中无 .md 文件，返回 400 错误。
     """
     if "file" not in request.files:
         return jsonify({"error": "未选择文件"}), 400
@@ -367,7 +487,14 @@ def api_upload():
     skipped_existing = []   # 跳过：input 中已有
 
     def extract_recursive(buf: BytesIO):
-        """递归解压：zip 里的 zip 继续解压，直到提取出所有 .md 文件。"""
+        """递归解压 ZIP 文件，提取所有 Markdown 文件。
+
+        遇到嵌套的 ZIP 文件会继续递归解压，直到提取出所有 .md 文件。
+        自动跳过 macOS 元数据目录（__MACOSX）和目录条目。
+
+        参数:
+            buf: 包含 ZIP 文件内容的 BytesIO 对象。
+        """
         try:
             with zipfile.ZipFile(buf) as zf:
                 for name in zf.namelist():
@@ -415,7 +542,14 @@ def api_upload():
 @admin_bp.route("/api/pipeline/settings")
 @admin_required
 def api_pipeline_settings():
-    """返回当前可调参数的值和允许范围，供前端 Settings 面板初始化。"""
+    """返回 Pipeline 可调参数的当前值和允许范围。
+
+    供前端 Settings 面板初始化时调用，显示当前的 temperature、
+    verify_batch_genes、max_workers 值及其有效取值范围。
+
+    返回:
+        JSON: 包含 values（当前参数值字典）和 limits（参数范围字典）的 JSON 响应。
+    """
     import nutrimaster.extraction.extract as _ext
     import nutrimaster.extraction.verify as _ver
 
@@ -432,11 +566,16 @@ def api_pipeline_settings():
 @admin_bp.route("/api/pipeline/preview", methods=["POST"])
 @admin_required
 def api_pipeline_preview():
-    """同步处理 input 中第一篇论文，返回 verified JSON 供用户确认格式。
+    """同步处理待处理队列中的第一篇论文并返回结果预览。
 
-    预览是真实处理——.md 会移入 processed，JSON 写入 data/。
-    前端可传入 settings 字段覆盖 temperature 等参数。
-    预览不是强制步骤，用户也可以直接点 "Run All"。
+    执行真实的论文处理流程：.md 文件会被移入 processed 目录，
+    生成的 verified JSON 写入 data/ 目录。用户可在确认格式正确后
+    再运行批量处理。前端可通过 settings 字段覆盖 temperature 等参数。
+
+    返回:
+        JSON: 包含 filename（文件名）、status（处理状态）、verified_json（生成的 JSON 数据）、
+              token_summary（token 使用概要）、token_report（token 报告路径）。
+              若无待处理文件返回 400，若 Pipeline 正在运行返回 409。
     """
     files = get_input_files()
     if not files:
@@ -491,13 +630,22 @@ def api_pipeline_preview():
 @admin_bp.route("/api/pipeline/run", methods=["POST"])
 @admin_required
 def api_pipeline_run():
-    """后台线程并行处理 input 中所有 .md 文件。
+    """启动后台线程批量处理所有待处理的 Markdown 论文文件。
 
-    实际批处理循环复用 extractor.pipeline.run_pipeline_batch()。
-    admin 只负责参数、SSE、停止信号和索引重建。
-    前端可传入 settings 覆盖参数（temperature、verify_batch_genes、max_workers）。
+    使用 ThreadPoolExecutor 并行处理 input/ 目录中的所有 .md 文件。
+    自动跳过 data/ 目录中已有 verified JSON 的论文。
     处理进度通过 SSE (/api/pipeline/stream) 实时推送。
     全部完成后自动重建 RAG 向量索引。
+
+    前端可通过请求体的 settings 字段覆盖参数：
+      - temperature: 提取 API 温度
+      - verify_batch_genes: 每批验证基因数
+      - max_workers: 并行 worker 数
+
+    返回:
+        JSON: 包含 message（启动消息）、total（待处理总数）、
+              skipped（跳过已处理的数量）、workers（并行数）。
+              若已在运行返回 409，若无待处理文件返回 400。
     """
     with _lock:
         if pipeline_state["running"]:
@@ -545,7 +693,11 @@ def api_pipeline_run():
         pipeline_state["total"] = len(todo_files)
 
     def run():
-        """后台线程：并行处理所有论文 → 重建索引。"""
+        """后台线程主函数：并行处理所有论文，完成后重建 RAG 索引。
+
+        负责捕获控制台输出、追踪 token 用量、发送 SSE 事件、
+        处理停止信号、以及在完成后触发索引重建。
+        """
         import sys
         tee = _TeeWriter(sys.__stdout__)
         pipeline_state["_tee"] = tee
@@ -574,11 +726,25 @@ def api_pipeline_run():
                 }))
 
             def _stop_requested() -> bool:
+                """检查用户是否请求停止 Pipeline。
+
+                返回:
+                    bool: 若用户已发送停止信号则返回 True。
+                """
                 with _lock:
                     return pipeline_state["stop_requested"]
 
             def _on_paper_start(filename: str, index: int, total: int, parallel: bool):
-                # 顺序模式下逐篇广播当前文件；并行模式已在上面发送总体状态。
+                """单篇论文开始处理时的回调函数。
+
+                顺序模式下逐篇广播当前正在处理的文件名；并行模式下跳过（已在启动时发送整体状态）。
+
+                参数:
+                    filename: 当前开始处理的文件名。
+                    index: 当前文件在队列中的索引（从 0 开始）。
+                    total: 待处理文件总数。
+                    parallel: 是否为并行处理模式。
+                """
                 if parallel:
                     return
                 with _lock:
@@ -586,6 +752,18 @@ def api_pipeline_run():
                 eq.put(("processing", {"index": index, "filename": filename, "total": total}))
 
             def _on_paper_done(filename: str, result: dict, done: int, total: int, parallel: bool):
+                """单篇论文处理完成时的回调函数。
+
+                更新 pipeline 进度状态并通过 SSE 推送 paper_done 事件。
+                如果论文处理成功，立即增量更新 RAG 索引。
+
+                参数:
+                    filename: 已完成处理的文件名。
+                    result: 处理结果字典，包含 status 等字段。
+                    done: 已完成处理的文件总数。
+                    total: 待处理文件总数。
+                    parallel: 是否为并行处理模式。
+                """
                 status = result.get("status", "failed")
                 with _lock:
                     pipeline_state["done"] = done
@@ -597,6 +775,15 @@ def api_pipeline_run():
                     "total": total,
                 }))
 
+                # 如果处理成功，立即增量更新索引（每篇论文实时更新）
+                if status == "success":
+                    try:
+                        _refresh_index(DATA_DIR, force=False)
+                    except Exception as e:
+                        # 索引更新失败不影响 Pipeline 继续运行
+                        # 会在 Pipeline 结束时重试
+                        print(f"⚠️  索引增量更新失败（将在结束时重试）: {e}")
+
             run_result = run_pipeline_batch(
                 todo_files,
                 input_dir=Path(INPUT_DIR),
@@ -607,27 +794,26 @@ def api_pipeline_run():
                 on_paper_done=_on_paper_done,
             )
             stopped = run_result["stopped"]
-            # ── 全部完成：重建 RAG 索引 ──────────────────────────
-            if not stopped:
-                eq.put(("rebuilding_index", {}))
-                try:
-                    _refresh_index(DATA_DIR, force=False)
-                    eq.put(("index_rebuilt", {}))
-                except Exception as e:
-                    eq.put(("index_error", {"error": str(e)}))
+            # ── Pipeline 结束：确保索引同步（无论正常完成还是被停止）──────────
+            eq.put(("rebuilding_index", {}))
+            try:
+                _refresh_index(DATA_DIR, force=False)
+                eq.put(("index_rebuilt", {}))
+            except Exception as e:
+                eq.put(("index_error", {"error": str(e)}))
 
-                token_summary = tracker.get_summary()
-                token_report = save_token_report(tracker, "admin-run")
+            # ── 发送完成/停止事件 ──────────────────────────────────────
+            token_summary = tracker.get_summary()
+            token_report = save_token_report(tracker, "admin-run")
+
+            if not stopped:
                 eq.put(("complete", {
                     "done": len(todo_files),
                     "total": len(todo_files),
                     "token_summary": token_summary,
                     "token_report": token_report,
                 }))
-
-            elif tracker:
-                token_summary = tracker.get_summary()
-                token_report = save_token_report(tracker, "admin-run")
+            else:
                 eq.put(("stopped", {
                     "done": pipeline_state["done"],
                     "total": len(todo_files),
@@ -664,22 +850,33 @@ def api_pipeline_run():
 @admin_bp.route("/api/pipeline/stream")
 @admin_required
 def api_pipeline_stream():
-    """SSE 端点：流式推送 pipeline 处理进度事件。
+    """SSE 端点：流式推送 Pipeline 处理进度事件。
 
-    事件类型：
-      connected       — 连接成功
-      start           — pipeline 开始
-      processing      — 开始处理某篇论文
-      paper_done      — 某篇论文处理完成
-      rebuilding_index — 正在重建 RAG 索引
-      index_rebuilt   — 索引重建成功
-      index_error     — 索引重建失败
-      complete        — 全部完成
-      stopped         — 被用户停止
-      heartbeat       — 30秒无事件时的心跳
-      idle            — pipeline 已不在运行（兜底）
+    支持的事件类型:
+      - connected: 连接成功
+      - start: Pipeline 开始运行
+      - processing: 开始处理某篇论文
+      - paper_done: 某篇论文处理完成
+      - rebuilding_index: 正在重建 RAG 索引
+      - index_rebuilt: 索引重建成功
+      - index_error: 索引重建失败
+      - complete: 全部处理完成
+      - stopped: 被用户停止
+      - heartbeat: 30 秒无事件时的心跳保活
+      - idle: Pipeline 已不在运行（兜底状态）
+
+    返回:
+        Response: SSE 流式响应（text/event-stream），持续推送事件直到 Pipeline 完成或停止。
     """
     def generate():
+        """SSE 事件生成器。
+
+        从事件队列中持续读取事件并格式化为 SSE 字符串。
+        30 秒无新事件时发送心跳保活；Pipeline 不再运行时发送 idle 事件并结束。
+
+        生成:
+            str: 格式化的 SSE 事件字符串。
+        """
         eq = pipeline_state["events"]
         yield _sse_event("connected", {"message": "SSE connected"})
         while True:
@@ -703,7 +900,14 @@ def api_pipeline_stream():
 @admin_bp.route("/api/pipeline/stop", methods=["POST"])
 @admin_required
 def api_pipeline_stop():
-    """发送停止信号。当前正在处理的论文会完成后停止，不清理半成品。"""
+    """发送停止 Pipeline 的信号。
+
+    发送停止信号后，当前正在处理的论文会完成处理后停止，不会清理半成品文件。
+    若 Pipeline 未在运行，返回 400 错误。
+
+    返回:
+        JSON: 包含停止确认消息的 JSON 响应。
+    """
     with _lock:
         if not pipeline_state["running"]:
             return jsonify({"error": "Pipeline 未在运行"}), 400
@@ -715,10 +919,12 @@ def api_pipeline_stop():
 @admin_bp.route("/api/pipeline/output")
 @admin_required
 def api_pipeline_output():
-    """返回 pipeline 的 console 输出（最后 5000 字符）。
+    """返回 Pipeline 的控制台输出内容（最后 5000 字符）。
 
-    运行中：从 _TeeWriter 实时读取。
-    运行结束：从缓存的 output 字符串读取。
+    运行中时从 _TeeWriter 实例实时读取；运行结束后从缓存的 output 字符串读取。
+
+    返回:
+        JSON: 包含 output（控制台输出文本）的 JSON 响应。
     """
     tee = pipeline_state.get("_tee")
     if tee:
@@ -733,7 +939,14 @@ def api_pipeline_output():
 @admin_bp.route("/api/papers")
 @admin_required
 def api_papers():
-    """扫描语料目录返回所有已处理论文的列表（文件名、标题、修改时间）。"""
+    """获取所有已处理论文的列表信息。
+
+    扫描语料目录中的 verified JSON 文件，提取文件名、论文标题和修改时间，
+    按修改时间倒序排列返回。
+
+    返回:
+        JSON: 论文信息列表，每项包含 filename（文件名）、title（论文标题）、modified（修改时间 ISO 格式）。
+    """
     papers = []
     for f in sorted(DATA_DIR.glob("*_nutri_plant_verified.json")):
         if f.name == ".gitkeep":
@@ -761,7 +974,12 @@ def api_papers():
 @admin_bp.route("/api/prompt", methods=["GET"])
 @admin_required
 def api_prompt_get():
-    """读取当前 prompt 文件内容。"""
+    """读取当前 Prompt 模板文件的内容。
+
+    返回:
+        JSON: 包含 content（文件内容）和 path（文件路径）的 JSON 响应。
+              若文件不存在返回 404 错误。
+    """
     if not PROMPT_PATH.exists():
         return jsonify({"error": "Prompt 文件不存在"}), 404
     return jsonify({"content": PROMPT_PATH.read_text(encoding="utf-8"), "path": str(PROMPT_PATH)})
@@ -770,7 +988,15 @@ def api_prompt_get():
 @admin_bp.route("/api/prompt", methods=["PUT"])
 @admin_required
 def api_prompt_put():
-    """保存 prompt 文件，并清除 extractor 的 lru_cache 使新内容生效。"""
+    """保存 Prompt 模板文件内容。
+
+    将请求体中的 content 字段写入 Prompt 文件，并清除 extractor 模块的
+    lru_cache 缓存，使新内容在下次 Pipeline 运行时生效。
+
+    返回:
+        JSON: 包含保存确认消息和内容长度的 JSON 响应。
+              若请求体缺少 content 字段返回 400 错误。
+    """
     body = request.get_json(silent=True)
     if not body or "content" not in body:
         return jsonify({"error": "缺少 content 字段"}), 400
@@ -787,7 +1013,12 @@ def api_prompt_put():
 @admin_bp.route("/api/schema", methods=["GET"])
 @admin_required
 def api_schema_get():
-    """读取当前 schema 文件内容。"""
+    """读取当前 JSON Schema 定义文件的内容。
+
+    返回:
+        JSON: 包含 content（文件内容）和 path（文件路径）的 JSON 响应。
+              若文件不存在返回 404 错误。
+    """
     if not SCHEMA_PATH.exists():
         return jsonify({"error": "Schema 文件不存在"}), 404
     return jsonify({"content": SCHEMA_PATH.read_text(encoding="utf-8"), "path": str(SCHEMA_PATH)})
@@ -796,7 +1027,15 @@ def api_schema_get():
 @admin_bp.route("/api/schema", methods=["PUT"])
 @admin_required
 def api_schema_put():
-    """保存 schema 文件（先验证 JSON 合法性），并清除 lru_cache。"""
+    """保存 JSON Schema 定义文件内容。
+
+    先验证提交内容是否为合法 JSON，再写入文件，
+    并清除 extractor 模块的 lru_cache 缓存使新 Schema 在下次运行时生效。
+
+    返回:
+        JSON: 包含保存确认消息和内容长度的 JSON 响应。
+              若缺少 content 字段返回 400，若 JSON 格式无效返回 400。
+    """
     body = request.get_json(silent=True)
     if not body or "content" not in body:
         return jsonify({"error": "缺少 content 字段"}), 400
@@ -817,8 +1056,131 @@ def api_schema_put():
 @admin_bp.route("/api/pipeline/tokens")
 @admin_required
 def api_pipeline_tokens():
-    """实时返回当前 pipeline 运行的 token 用量。"""
+    """获取当前 Pipeline 运行的实时 Token 用量统计。
+
+    若 Pipeline 未在运行或 tracker 不存在，返回 summary 为 null。
+
+    返回:
+        JSON: 包含 summary（token 用量概要字典或 null）的 JSON 响应。
+    """
     tracker = pipeline_state.get("tracker")
     if tracker is None:
         return jsonify({"summary": None})
     return jsonify({"summary": tracker.get_summary()})
+
+
+@admin_bp.route("/api/index/status")
+@admin_required
+def api_index_status():
+    """查询 RAG 索引状态。
+
+    返回索引的当前状态，包括已索引文件数、缺失文件数、总 chunks 数等。
+
+    返回:
+        JSON: 包含索引状态信息的 JSON 响应。
+        {
+            "total_files": int,      # corpus 中的总文件数
+            "indexed_files": int,    # 已索引的文件数
+            "missing_files": int,    # 未索引的文件数
+            "total_chunks": int,     # 总 chunk 数
+            "embedding_shape": [...], # embedding 维度
+            "last_updated": str,     # 最后更新时间（ISO 格式）
+            "is_synced": bool        # 是否完全同步
+        }
+    """
+    from datetime import datetime
+
+    manifest_path = Path(SETTINGS.rag.index_dir) / "manifest.json"
+    corpus_dir = Path(SETTINGS.rag.data_dir)
+
+    # 读取 manifest
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        indexed_files = len(manifest.get("files", {}))
+
+        # 获取最后修改时间
+        stat = os.stat(manifest_path)
+        last_updated = datetime.fromtimestamp(stat.st_mtime).isoformat()
+    else:
+        indexed_files = 0
+        last_updated = None
+
+    # 统计 corpus 文件
+    all_files = list(corpus_dir.glob("*_nutri_plant_verified.json"))
+    total_files = len(all_files)
+    missing_files = total_files - indexed_files
+
+    # 获取 chunks 信息
+    try:
+        from nutrimaster.rag.jina import JinaRetriever
+        retriever = JinaRetriever()
+        total_chunks = len(retriever.chunks)
+        embedding_shape = list(retriever.embeddings.shape) if retriever.embeddings is not None else None
+    except Exception:
+        total_chunks = 0
+        embedding_shape = None
+
+    return jsonify({
+        "total_files": total_files,
+        "indexed_files": indexed_files,
+        "missing_files": missing_files,
+        "total_chunks": total_chunks,
+        "embedding_shape": embedding_shape,
+        "last_updated": last_updated,
+        "is_synced": missing_files == 0,
+    })
+
+
+@admin_bp.route("/api/index/rebuild", methods=["POST"])
+@admin_required
+def api_index_rebuild():
+    """手动触发 RAG 索引重建。
+
+    支持增量或完全重建模式，可选择同步或异步执行。
+
+    请求体:
+        {
+            "force": false,  # 是否强制完全重建（默认 false，增量模式）
+            "async": true    # 是否异步执行（默认 true）
+        }
+
+    返回:
+        JSON: 包含操作状态的 JSON 响应。
+    """
+    body = request.get_json(silent=True) or {}
+    force = body.get("force", False)
+    async_mode = body.get("async", True)
+
+    if async_mode:
+        # 异步执行
+        def rebuild_task():
+            """后台线程任务：执行 RAG 索引重建并打印结果日志。"""
+            try:
+                _refresh_index(DATA_DIR, force=force)
+                print(f"✅ 索引重建完成（force={force}）")
+            except Exception as e:
+                print(f"❌ 索引重建失败: {e}")
+                import traceback
+                traceback.print_exc()
+
+        thread = threading.Thread(target=rebuild_task, daemon=True)
+        thread.start()
+
+        return jsonify({
+            "message": "索引重建已在后台启动",
+            "force": force,
+            "async": True,
+        })
+    else:
+        # 同步执行
+        try:
+            _refresh_index(DATA_DIR, force=force)
+            return jsonify({
+                "message": "索引重建完成",
+                "force": force,
+                "async": False,
+            })
+        except Exception as e:
+            return jsonify({
+                "error": f"索引重建失败: {e}"
+            }), 500

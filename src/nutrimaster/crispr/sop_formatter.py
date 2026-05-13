@@ -20,24 +20,80 @@ _SECTION_CANDIDATES = {"总体流程概览", "附录", "参考文献", "参考�
 
 
 def _is_list_item(line: str) -> bool:
+    """判断一行文本是否为列表项。
+
+    支持识别以 "•" 开头的无序列表、"o\\t" 开头的子列表项和 "数字.\\t" 开头的有序列表。
+
+    Args:
+        line: 待判断的单行文本。
+
+    Returns:
+        bool: 如果是列表项返回 True，否则返回 False。
+    """
     return bool(line.startswith("•") or re.match(r"^o\t", line) or re.match(r"^\d+\.\t", line))
 
 
 def _is_table_row(line: str) -> bool:
+    """判断一行文本是否为制表符分隔的表格行。
+
+    要求包含制表符且不是列表项，并且按制表符拆分后至少有 2 个非空单元格。
+
+    Args:
+        line: 待判断的单行文本。
+
+    Returns:
+        bool: 如果是表格行返回 True，否则返回 False。
+    """
     if "\t" not in line or _is_list_item(line):
         return False
     return len([part for part in (item.strip() for item in line.split("\t")) if part]) >= 2
 
 
 def _make_table_row(line: str) -> str:
+    """将制表符分隔的行转换为 Markdown 表格行格式。
+
+    Args:
+        line: 制表符分隔的文本行。
+
+    Returns:
+        str: Markdown 表格行（如 "| 列1 | 列2 | 列3 |"）。
+    """
     return "| " + " | ".join(part.strip() or " " for part in line.split("\t")) + " |"
 
 
 def _make_table_separator(line: str) -> str:
+    """根据制表符分隔的行生成 Markdown 表格分隔行。
+
+    Args:
+        line: 制表符分隔的文本行，用于确定列数。
+
+    Returns:
+        str: Markdown 表格分隔行（如 "| --- | --- | --- |"）。
+    """
     return "| " + " | ".join("---" for _ in line.split("\t")) + " |"
 
 
 def format_sop_to_markdown(text: str) -> str:
+    """将 SOP 纯文本格式转换为结构化的 Markdown 文档。
+
+    识别并转换以下元素：
+    - 文档标题（首行转为 H1）
+    - 元数据行（物种、系统等，转为加粗标签）
+    - Step 步骤标题（转为 H2）
+    - 数字编号的章节和小节标题（转为 H3/H4）
+    - Day 时间标记（转为 H4）
+    - 注意/推荐等提示信息（转为 Markdown 引用块）
+    - 列表项（无序/有序/子列表）
+    - 制表符分隔的表格（转为 Markdown 表格）
+    - 流程图字符（用代码块包裹）
+    - 水平分隔线
+
+    Args:
+        text: SOP 纯文本内容。
+
+    Returns:
+        str: 转换后的 Markdown 格式文本。
+    """
     lines = text.split("\n")
     output: list[str] = []
     in_flow = False

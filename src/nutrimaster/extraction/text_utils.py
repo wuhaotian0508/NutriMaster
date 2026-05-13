@@ -1,5 +1,7 @@
 """
-text_utils.py — Text preprocessing for the extractor pipeline.
+text_utils.py — 提取管线的文本预处理工具模块。
+
+提供 Markdown 文本清洗和基于 LLM 的 section 过滤功能。
 """
 
 import re
@@ -13,17 +15,15 @@ import json
 def preprocess_md(md_content):
     """纯本地文本清洗，不调用任何远程 API。
 
-    [PR 改动] 原来的 preprocess_md() 内部直接调了 extract_relevant_sections()（会发 LLM 请求），
-    现在拆成两层：preprocess_md() 只做本地清洗，preprocess_md_for_llm() 才加 LLM 过滤。
-    这样方便测试、RAG 等场景复用纯本地清洗逻辑。
-
-    步骤：去图片标签 → 去 URL → 合并多余空行
+    分为三步：去除图片标签 → 去除 URL 链接 → 合并多余空行。
+    与 preprocess_md_for_llm() 不同，本函数完全在本地执行，
+    适合测试、RAG 检索等不需要 LLM 参与的场景。
 
     Args:
         md_content: MinerU 转换后的 Markdown 原始文本
 
     Returns:
-        清洗后的文本
+        str: 清洗后的文本
     """
     content = strip_images(md_content)
     content = strip_urls(content)
@@ -34,12 +34,16 @@ def preprocess_md(md_content):
 def preprocess_md_for_llm(md_content, tracker=None):
     """用于提取/验证的完整预处理：本地清洗 + LLM section 过滤。
 
-    [PR 新增函数] 在 preprocess_md() 基础上，额外调用 LLM 判断各 section 标题，
-    去掉 Introduction/References/Acknowledgments 等无关内容，只保留 Results + Methods。
+    在 preprocess_md() 的基础上，额外调用 LLM 判断各 section 标题，
+    去掉 Introduction/References/Acknowledgments 等无关内容，只保留
+    Results + Methods 等与基因提取相关的部分。
 
     Args:
         md_content: Markdown 原始文本
         tracker: 可选的 TokenTracker，用于追踪 LLM section 分类的 token 用量
+
+    Returns:
+        str: 预处理后的文本（本地清洗 + section 过滤）
     """
     content = preprocess_md(md_content)
     return extract_relevant_sections(content, tracker=tracker)
@@ -52,7 +56,13 @@ def preprocess_md_for_llm(md_content, tracker=None):
 def strip_images(md_content):
     """去除 Markdown 图片标签（CDN 和本地路径两种格式）。
 
-    例: ![alt](https://cdn.com/img.png) → 删除
+    匹配 ![alt](url) 格式的图片引用并删除。
+
+    Args:
+        md_content: 待清洗的 Markdown 文本
+
+    Returns:
+        str: 去除图片标签后的文本
     """
     return re.sub(r'!\[[^\]]*\]\([^)]*\)', '', md_content)
 
@@ -60,13 +70,26 @@ def strip_images(md_content):
 def strip_urls(md_content):
     """去除括号内的 URL 链接。
 
-    例: (https://doi.org/10.1234) → 删除
+    匹配 (https://...) 或 (http://...) 格式的括号内链接并删除。
+
+    Args:
+        md_content: 待清洗的 Markdown 文本
+
+    Returns:
+        str: 去除 URL 后的文本
     """
     return re.sub(r'\(https?://[^)]*\)', '', md_content)
 
 
 def strip_extra_blanks(md_content):
-    """合并多余空行：3个以上连续空行 → 2个。"""
+    """合并多余空行：3 个以上连续空行压缩为 2 个。
+
+    Args:
+        md_content: 待清洗的 Markdown 文本
+
+    Returns:
+        str: 合并空行后的文本
+    """
     return re.sub(r'\n{3,}', '\n\n', md_content)
 
 
@@ -77,9 +100,16 @@ def strip_extra_blanks(md_content):
 def _split_sections(md_content):
     """按一级标题（# ）把 Markdown 拆分为多个 section。
 
+    扫描文本中所有以 "# " 开头的行作为分隔点，
+    将文本切分为 preamble（标题前内容）和多个 (标题, 正文) 元组。
+
+    Args:
+        md_content: 完整的 Markdown 文本
+
     Returns:
-        preamble: 第一个 # 标题之前的内容（通常是论文标题/摘要）
-        sections: [(标题, 正文), ...] 列表
+        tuple: (preamble, sections)
+            - preamble: 第一个 # 标题之前的内容（通常是论文标题/摘要）
+            - sections: [(标题字符串, 正文字符串), ...] 列表
     """
     heading_pattern = re.compile(r'^# ', re.MULTILINE)
     matches = list(heading_pattern.finditer(md_content))
@@ -112,16 +142,15 @@ def _classify_headings_with_llm(headings, tracker=None):
     """调用 LLM 判断哪些 section 标题应该被移除。
 
     给 LLM 发一个编号标题列表，让它返回要移除的编号（JSON 数组）。
+    例如 Introduction、References、Acknowledgments 等无关 section 会被标记移除。
     调用 extraction API；失败时返回 None，由上层使用原文继续处理。
 
-    [PR 改动] 新增 tracker 参数，支持追踪 section 分类这一步的 token 用量。
-
     Args:
-        headings: 所有 # 标题的列表
-        tracker: 可选的 TokenTracker
+        headings: 所有 # 标题的字符串列表
+        tracker: 可选的 TokenTracker，用于追踪此次 LLM 调用的 token 用量
 
     Returns:
-        set[int]: 要移除的标题索引集合，LLM 调用失败返回 None
+        set[int] | None: 要移除的标题索引集合，LLM 调用失败时返回 None
     """
     from .config import get_openai_client, EXTRACTOR_MODEL
 
@@ -155,6 +184,15 @@ If nothing should be removed, return: []"""
     ]
 
     def _try_call(client, model):
+        """尝试调用指定的 LLM 客户端进行 section 标题分类。
+
+        Args:
+            client: OpenAI 客户端实例
+            model: 模型名称
+
+        Returns:
+            set[int] | None: 要移除的标题索引集合，解析失败返回 None
+        """
         response = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -182,13 +220,18 @@ If nothing should be removed, return: []"""
 def extract_relevant_sections(md_content, tracker=None):
     """去除无关 section（Introduction/References/Acknowledgments 等）。
 
-    [PR 改动] 新增 tracker 参数。
-
     流程：
     1. 按 # 标题拆分所有 section
     2. 调用一次 LLM 分类哪些标题要移除
     3. 重新拼接：preamble + 保留的 section
     4. LLM 调用失败则 fallback 使用全文
+
+    Args:
+        md_content: 经过本地清洗后的 Markdown 文本
+        tracker: 可选的 TokenTracker，用于追踪 LLM 分类的 token 用量
+
+    Returns:
+        str: 去除无关 section 后的文本，LLM 失败时返回原文
     """
     preamble, sections = _split_sections(md_content)
 

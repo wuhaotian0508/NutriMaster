@@ -1,8 +1,7 @@
 """
-config.py — Centralized configuration for the extractor pipeline.
+config.py — 提取管线的集中配置模块。
 
-All paths, API settings, and concurrency settings.
-
+包含所有路径配置、API 设置和并发参数。
 """
 
 import os
@@ -37,7 +36,14 @@ _primary_client = None
 
 
 def get_openai_client():
-    """获取 extraction 专用 OpenAI 客户端（单例缓存）。"""
+    """获取 extraction 专用 OpenAI 客户端（单例缓存）。
+
+    使用环境变量 OPENAI_API_KEY 和 OPENAI_BASE_URL 初始化客户端。
+    整个进程只创建一次，后续调用返回同一实例。
+
+    Returns:
+        OpenAI: 配置好的 OpenAI 客户端实例
+    """
     global _primary_client
     if _primary_client is None:
         _primary_client = OpenAI(
