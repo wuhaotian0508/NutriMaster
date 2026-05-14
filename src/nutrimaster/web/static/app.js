@@ -103,6 +103,9 @@ const I18N = {
         'tool.used': '使用了',
         'tool.skill': '技能',
         'tool.details': '详情',
+        // 思考过程
+        'thinking.streaming': '思考中...',
+        'thinking.done': '思考过程',
         // 搜索进度
         'search.searching': '正在搜索...',
         'search.deepSearching': '深度搜索中，正在检索更多文献并生成综合报告...',
@@ -245,6 +248,9 @@ const I18N = {
         'tool.used': 'Used',
         'tool.skill': 'Skill',
         'tool.details': 'Details',
+        // Thinking
+        'thinking.streaming': 'Thinking...',
+        'thinking.done': 'Thinking process',
         'search.searching': 'Searching...',
         'search.deepSearching': 'Deep search: retrieving more literature and generating a comprehensive report...',
         'source.title': '📚 References',
@@ -904,6 +910,10 @@ async function streamQuery(query, messageId) {
                         const state = getAssistantTurnState(messageId);
                         state.selectedSkill = data.data;
                         updateToolCallsUI(messageId);
+                    } else if (data.type === 'thinking') {
+                        const state = getAssistantTurnState(messageId);
+                        state.thinkingText += data.data || '';
+                        updateThinkingUI(messageId, state.thinkingText, true);
                     } else if (data.type === 'tool_call') {
                         const state = getAssistantTurnState(messageId);
                         state.toolCalls.push({ tool: data.tool, args: data.args, done: false });
@@ -929,6 +939,8 @@ async function streamQuery(query, messageId) {
                         const state = getAssistantTurnState(messageId);
                         state.sources = sources;
                     } else if (data.type === 'text') {
+                        // 收到正式回答后，结束思考状态
+                        finalizeThinkingUI(messageId);
                         answerText += data.data;
                         const state = getAssistantTurnState(messageId);
                         state.answerText = answerText;
@@ -962,6 +974,7 @@ async function streamQuery(query, messageId) {
                     } else if (data.type === 'done') {
                         const state = getAssistantTurnState(messageId);
                         state.streamDone = true;
+                        finalizeThinkingUI(messageId);
                         finalizeToolCallsUI(messageId);
 
                         updateMessage(messageId, formatAnswer(answerText, sources, messageId));
@@ -1401,6 +1414,7 @@ function getAssistantTurnState(messageId) {
             interactionId: '',
             turnId: '',
             feedbackSubmitted: '',
+            thinkingText: '',     // 思考内容
         });
     }
     return assistantTurnState.get(messageId);
@@ -1493,6 +1507,59 @@ function finalizeToolCallsUI(messageId) {
         </div>
         ${detailHtml ? `<div class="tool-calls-detail">${detailHtml}</div>` : ''}
     `;
+}
+
+// ===== 思考过程 UI =====
+
+/** 实时更新思考内容（streaming 阶段） */
+function updateThinkingUI(messageId, thinkingText, isStreaming = false) {
+    const msgEl = document.getElementById(messageId);
+    if (!msgEl) return;
+
+    let thinkingContainer = msgEl.querySelector('.thinking-container');
+    if (!thinkingContainer) {
+        // 首次创建思考容器，插入到 tool-calls-summary 之后
+        const summaryEl = msgEl.querySelector('.tool-calls-summary');
+        if (!summaryEl) return;
+
+        thinkingContainer = document.createElement('div');
+        thinkingContainer.className = 'thinking-container';
+        summaryEl.insertAdjacentElement('afterend', thinkingContainer);
+    }
+
+    const spinnerHtml = isStreaming ? '<span class="search-spinner"></span>' : '';
+    const headerText = isStreaming ? t('thinking.streaming') : t('thinking.done');
+    thinkingContainer.innerHTML = `
+        <div class="thinking-header" onclick="this.parentElement.classList.toggle('expanded')">
+            <span class="thinking-header-text">${spinnerHtml}💭 ${escapeHtml(headerText)}</span>
+            <span class="thinking-toggle">▸</span>
+        </div>
+        <div class="thinking-content">
+            <pre>${escapeHtml(thinkingText)}</pre>
+        </div>
+    `;
+}
+
+/** 结束思考状态（收到正式回答或 done 事件时） */
+function finalizeThinkingUI(messageId) {
+    const msgEl = document.getElementById(messageId);
+    if (!msgEl) return;
+
+    const thinkingContainer = msgEl.querySelector('.thinking-container');
+    if (!thinkingContainer) return;
+
+    const state = getAssistantTurnState(messageId);
+    if (!state.thinkingText) {
+        // 没有思考内容，移除容器
+        thinkingContainer.remove();
+        return;
+    }
+
+    // 更新为最终状态（移除 spinner）
+    const headerEl = thinkingContainer.querySelector('.thinking-header-text');
+    if (headerEl) {
+        headerEl.innerHTML = `💭 ${escapeHtml(t('thinking.done'))}`;
+    }
 }
 
 function getMessageRegions(messageId) {
@@ -2108,9 +2175,14 @@ function renderSOPs(container, sops) {
         headerEl.className = 'experiment-sop-header';
 
         // 生成下载文件名：基因名（accession）+ 登录账号
-        const userEmail = (typeof currentSession !== 'undefined' && currentSession?.user?.email)
-            ? currentSession.user.email.split('@')[0]
-            : 'user';
+        let userEmail = 'user';
+        try {
+            if (typeof currentSession !== 'undefined' && currentSession && currentSession.user && currentSession.user.email) {
+                userEmail = currentSession.user.email.split('@')[0];
+            }
+        } catch (e) {
+            // 忽略错误，使用默认值
+        }
         const safeAccession = accession.replace(/[^a-zA-Z0-9\-_]/g, '_');
         const downloadFilename = `${safeAccession}_${userEmail}.doc`;
 

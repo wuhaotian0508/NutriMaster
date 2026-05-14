@@ -42,6 +42,14 @@ _GENE_PREFIX_TO_SPECIES = {
 
 
 def _strip_species_prefix(gene_name: str) -> str | None:
+    """去除基因名中的物种缩写前缀（如 Gm、At、Os 等）。
+
+    Args:
+        gene_name: 原始基因名（如 "GmFAD2"）。
+
+    Returns:
+        str | None: 去除前缀后的基因名（如 "FAD2"）；如果没有匹配的前缀，返回 None。
+    """
     for prefix in sorted(_GENE_PREFIX_TO_SPECIES, key=len, reverse=True):
         if gene_name.startswith(prefix) and len(gene_name) > len(prefix):
             return gene_name[len(prefix):]
@@ -49,6 +57,17 @@ def _strip_species_prefix(gene_name: str) -> str | None:
 
 
 def _normalize_species_name(species: str) -> str:
+    """将物种名称标准化为完整的拉丁学名。
+
+    支持缩写形式（如 "G. max" -> "Glycine max"）和属名缩写（如 "O." -> "Oryza"）。
+    如果已经是标准格式或无法识别，则原样返回。
+
+    Args:
+        species: 原始物种名称字符串。
+
+    Returns:
+        str: 标准化后的物种拉丁学名；输入为空时返回空字符串。
+    """
     if not species:
         return ""
     species = species.strip()
@@ -64,6 +83,16 @@ def _normalize_species_name(species: str) -> str:
 
 
 def _esearch_gene(gene_name: str, species: str, retmax: int = 10) -> list[str]:
+    """在 NCBI Gene 数据库中按基因名和物种搜索基因 ID。
+
+    Args:
+        gene_name: 基因名称。
+        species: 物种拉丁学名，用于限定搜索范围。
+        retmax: 最多返回的结果数量，默认 10。
+
+    Returns:
+        list[str]: 匹配的 NCBI Gene ID 列表。
+    """
     query = f'"{gene_name}"[Gene Name]'
     if species:
         query += f' AND "{species}"[Organism]'
@@ -73,6 +102,18 @@ def _esearch_gene(gene_name: str, species: str, retmax: int = 10) -> list[str]:
 
 
 def _search_gene_ids(gene_name: str, species: str, retmax: int = 10) -> list[str]:
+    """多策略搜索 NCBI Gene 数据库中的基因 ID。
+
+    依次尝试：精确基因名搜索 -> 去除物种前缀后搜索 -> 宽泛关键词搜索。
+
+    Args:
+        gene_name: 基因名称（可能包含物种前缀）。
+        species: 物种拉丁学名。
+        retmax: 最多返回的结果数量，默认 10。
+
+    Returns:
+        list[str]: 匹配的 NCBI Gene ID 列表。
+    """
     ids = _esearch_gene(gene_name, species, retmax)
     if ids:
         return ids
@@ -88,6 +129,14 @@ def _search_gene_ids(gene_name: str, species: str, retmax: int = 10) -> list[str
 
 
 def _link_gene_to_nuccore(gene_id: str) -> list[str]:
+    """通过 NCBI Entrez elink 将 Gene ID 关联到核酸数据库（nuccore）记录。
+
+    Args:
+        gene_id: NCBI Gene 数据库的基因 ID。
+
+    Returns:
+        list[str]: 关联的核酸数据库记录 ID 列表。
+    """
     with Entrez.elink(dbfrom="gene", db="nuccore", id=gene_id) as handle:
         record = Entrez.read(handle)
     return [
@@ -98,6 +147,14 @@ def _link_gene_to_nuccore(gene_id: str) -> list[str]:
 
 
 def _fetch_nuccore_summaries(nuccore_ids: list[str]) -> list[dict]:
+    """批量获取核酸数据库记录的摘要信息（accession 和标题）。
+
+    Args:
+        nuccore_ids: NCBI 核酸数据库记录 ID 列表。
+
+    Returns:
+        list[dict]: 包含 "accession" 和 "title" 键的字典列表；输入为空时返回空列表。
+    """
     if not nuccore_ids:
         return []
     with Entrez.esummary(db="nuccore", id=",".join(nuccore_ids)) as handle:
@@ -106,6 +163,18 @@ def _fetch_nuccore_summaries(nuccore_ids: list[str]) -> list[dict]:
 
 
 def _direct_nuccore_search(gene_name: str, species: str, retmax: int = 10) -> list[dict]:
+    """直接在 NCBI 核酸数据库中按基因名和物种搜索序列记录。
+
+    当通过 Gene -> nuccore 关联路径无法找到结果时，作为备选方案使用。
+
+    Args:
+        gene_name: 基因名称。
+        species: 物种拉丁学名。
+        retmax: 最多返回的结果数量，默认 10。
+
+    Returns:
+        list[dict]: 包含 "accession" 和 "title" 键的字典列表。
+    """
     query = f'"{gene_name}"'
     if species:
         query += f' AND "{species}"[Organism]'
@@ -115,6 +184,17 @@ def _direct_nuccore_search(gene_name: str, species: str, retmax: int = 10) -> li
 
 
 def _pick_best_accession(records: list[dict], gene_name: str) -> str:
+    """从多条核酸记录中选择最佳的 accession 编号。
+
+    优先选择标题中包含基因名的记录，其次优先选择 mRNA/cDNA/transcript 类型的记录。
+
+    Args:
+        records: 核酸记录字典列表，每个字典包含 "accession" 和 "title"。
+        gene_name: 基因名称，用于匹配标题。
+
+    Returns:
+        str: 最佳匹配的 accession 编号；如果记录列表为空，返回空字符串。
+    """
     if not records:
         return ""
     gene_name_lower = gene_name.lower()
@@ -135,6 +215,19 @@ def _pick_best_accession(records: list[dict], gene_name: str) -> str:
 
 
 def _find_accession_for_gene(gene_name: str, species: str, pause: float = 0.34) -> str:
+    """为单个基因查找最佳的 NCBI 核酸 accession 编号。
+
+    完整查找流程：搜索 Gene ID -> 关联 nuccore 记录 -> 选择最佳 accession。
+    如果关联路径无结果，回退到直接核酸数据库搜索。每次 API 调用间有短暂停顿以避免限流。
+
+    Args:
+        gene_name: 基因名称。
+        species: 物种名称（会自动标准化）。
+        pause: 每次 NCBI API 调用之间的等待秒数，默认 0.34 秒。
+
+    Returns:
+        str: 最佳匹配的 accession 编号；找不到时返回空字符串。
+    """
     normalized_species = _normalize_species_name(species)
     gene_ids = _search_gene_ids(gene_name, normalized_species)
     time.sleep(pause)
@@ -154,6 +247,21 @@ def _find_accession_for_gene(gene_name: str, species: str, pause: float = 0.34) 
 
 
 def run_gene2accession(genes: list[dict], work_dir: Path) -> Path:
+    """批量查询基因列表对应的 NCBI 核酸 accession 编号，并将结果写入文件。
+
+    对每个基因调用 NCBI Entrez API 查找 accession，结果以 TSV 格式（基因名\\t物种\\taccession）
+    写入 work_dir/accession.txt 文件。
+
+    Args:
+        genes: 基因信息字典列表，每个字典需包含 "gene"（基因名）和 "species"（物种名）。
+        work_dir: 工作目录，输出文件将写入此目录。
+
+    Returns:
+        Path: 生成的 accession 文件路径（work_dir/accession.txt）。
+
+    Raises:
+        ValueError: 所有基因均未能找到 accession 时抛出。
+    """
     Entrez.email = _ENTREZ_EMAIL
     acc_file = work_dir / "accession.txt"
     results = []

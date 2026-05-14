@@ -28,12 +28,27 @@ logger = logging.getLogger(__name__)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    """创建并配置 NutriMaster FastAPI 应用实例。
+
+    初始化所有核心服务（检索器、Agent、工具注册表等），配置 CORS 中间件、
+    异常处理、上传限制、路由、静态文件服务，并挂载 Flask 管理后台。
+
+    参数:
+        settings: 应用配置对象。若为 None，则从环境变量自动加载。
+
+    返回:
+        FastAPI: 完整配置的 FastAPI 应用实例。
+
+    异常:
+        RuntimeError: 当 RAG 配置初始化失败时抛出。
+    """
     settings = settings or Settings.from_env()
     if settings.rag is None:
         raise RuntimeError("RAG settings failed to initialize")
 
     app = FastAPI(title="NutriMaster", docs_url=None, redoc_url=None)
     app.state.settings = settings
+    logger.info("正在初始化 Web 服务与检索索引...")
     app.state.services = create_services(settings)
     app.state.limiter = Limiter(key_func=get_remote_address)
 
@@ -58,12 +73,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 def _install_exception_handlers(app: FastAPI) -> None:
+    """为 FastAPI 应用安装全局异常处理器。
+
+    注册两个异常处理器：
+      1. RateLimitExceeded: 请求频率超限时返回 429 错误响应。
+      2. Exception: 捕获所有未处理异常，记录堆栈日志并返回 500 错误（HTTPException 除外）。
+
+    参数:
+        app: FastAPI 应用实例。
+    """
     @app.exception_handler(RateLimitExceeded)
     async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+        """处理请求频率超限异常。
+
+        参数:
+            request: 当前 HTTP 请求对象。
+            exc: 频率限制超出异常实例。
+
+        返回:
+            JSONResponse: 包含错误提示的 429 状态码响应。
+        """
         return JSONResponse({"error": "请求频率过高，请稍后再试"}, status_code=429)
 
     @app.exception_handler(Exception)
     async def _generic_exception_handler(request: Request, exc: Exception):
+        """处理所有未捕获的通用异常并记录日志。
+
+        HTTPException 会被直接重新抛出，由 FastAPI 框架自行处理。
+
+        参数:
+            request: 当前 HTTP 请求对象。
+            exc: 未处理的异常实例。
+
+        返回:
+            JSONResponse: 包含通用错误提示的 500 状态码响应。
+        """
         if isinstance(exc, HTTPException):
             raise exc
         logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
@@ -71,10 +115,26 @@ def _install_exception_handlers(app: FastAPI) -> None:
 
 
 def _install_upload_limit(app: FastAPI) -> None:
+    """为 FastAPI 应用安装文件上传大小限制中间件。
+
+    检查请求的 Content-Length header，若超过 50MB 限制则拒绝请求并返回 413 错误。
+
+    参数:
+        app: FastAPI 应用实例。
+    """
     max_upload_bytes = 50 * 1024 * 1024
 
     @app.middleware("http")
     async def limit_upload_size(request: Request, call_next):
+        """HTTP 中间件：检查上传文件大小是否超过限制。
+
+        参数:
+            request: 当前 HTTP 请求对象。
+            call_next: 调用链中的下一个中间件或路由处理函数。
+
+        返回:
+            Response: 正常响应或 413 文件过大错误响应。
+        """
         content_length = request.headers.get("content-length")
         if content_length:
             try:
@@ -86,6 +146,7 @@ def _install_upload_limit(app: FastAPI) -> None:
 
 
 def _install_routes(app: FastAPI) -> None:
+    """注册所有 API 路由。"""
     app.include_router(query.router)
     app.include_router(experiment.router)
     app.include_router(library.router)
@@ -95,21 +156,25 @@ def _install_routes(app: FastAPI) -> None:
 
 
 def _install_static(app: FastAPI) -> None:
+    """挂载静态文件目录并注册首页路由。"""
     static_dir = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     @app.get("/")
     async def index():
+        """返回首页 HTML 文件。"""
         return FileResponse(str(static_dir / "index.html"))
 
 
 def _mount_extraction_admin(app: FastAPI) -> None:
+    """挂载 Flask extraction admin 蓝图到 /admin 路径。"""
     from flask import Flask as FlaskApp
     from nutrimaster.web.admin.app import admin_bp, configure_index_refresh
 
     services = app.state.services
 
     def refresh_admin_index(data_dir: Path, force: bool = False) -> None:
+        """刷新管理后台索引的回调函数。"""
         services.refresh_index(data_dir=data_dir, force=force)
 
     flask_app = FlaskApp(__name__, static_folder=None)

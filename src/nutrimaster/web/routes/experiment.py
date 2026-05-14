@@ -18,6 +18,23 @@ async def experiment_preview(
     user=Depends(get_current_user),
     services: WebServices = Depends(get_services),
 ):
+    """预览实验设计方案，返回候选基因列表。
+
+    根据用户提供的研究目标或基因列表，调用实验设计服务生成候选基因预览。
+    支持从 goal、query、answer_text 等多个字段读取研究目标，
+    以及从 selected_gene_names 或 user_genes 字段读取用户指定的基因。
+
+    参数:
+        request: FastAPI 请求对象，请求体应包含 goal/query 或 genes 字段。
+        user: 当前登录用户（通过依赖注入获取）。
+        services: Web 服务容器（通过依赖注入获取）。
+
+    返回:
+        JSONResponse: 包含 genes 候选基因列表的 JSON 响应。
+
+    异常:
+        HTTPException: 缺少 goal 和 genes 时返回 400，服务异常时返回 500。
+    """
     data = await request.json()
     goal = (data.get("goal") or data.get("query") or data.get("answer_text") or "").strip()
     genes = data.get("genes") or None
@@ -42,12 +59,42 @@ async def experiment_run(
     user=Depends(get_current_user),
     services: WebServices = Depends(get_services),
 ):
+    """执行完整的实验设计 Pipeline 并通过 SSE 流式返回结果。
+
+    根据请求体中的基因列表执行一键实验设计流程，生成标准操作规程（SOP）。
+    通过 Server-Sent Events 实时推送执行进度和最终结果。
+
+    SSE 事件类型:
+      - progress: 执行进度更新
+      - result: 包含生成的 SOP 结果
+      - done: 执行完成
+      - error: 执行出错
+
+    参数:
+        request: FastAPI 请求对象，请求体应包含 genes 基因列表。
+        user: 当前登录用户（通过依赖注入获取）。
+        services: Web 服务容器（通过依赖注入获取）。
+
+    返回:
+        StreamingResponse: SSE 流式响应。
+
+    异常:
+        HTTPException: 缺少 genes 列表时返回 400。
+    """
     data = await request.json()
     genes = data.get("genes")
     if not genes:
         raise HTTPException(status_code=400, detail="缺少 genes 列表")
 
     async def generate():
+        """SSE 流式事件生成器。
+
+        逐步推送实验执行的进度信息和最终生成的 SOP 结果。
+        异常时推送 error 事件。
+
+        生成:
+            str: 格式化的 SSE 数据字符串。
+        """
         try:
             yield sse({"type": "progress", "step": 1, "total": 1, "msg": "正在执行一键实验 pipeline..."})
             sops = await services.experiment_service.run(genes=genes)

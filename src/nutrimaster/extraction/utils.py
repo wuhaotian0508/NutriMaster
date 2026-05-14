@@ -1,7 +1,8 @@
 """
-utils.py — Shared utilities for the extractor pipeline.
+utils.py — 提取管线的共享工具函数模块。
 
-Consolidates repeated patterns found across extract.py, verify.py, and pipeline.py.
+整合了 extract.py、verify.py 和 pipeline.py 中重复出现的模式，
+包括基因数组常量、防御性解析、JSON 修复和 DeepSeek 兼容性处理。
 """
 
 import json

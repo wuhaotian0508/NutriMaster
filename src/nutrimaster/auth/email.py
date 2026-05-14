@@ -14,14 +14,19 @@ logger = logging.getLogger(__name__)
 
 def send_verification_code(to_email: str, code: str) -> bool:
     """
-    发送验证码邮件到指定邮箱
+    通过 163 SMTP 服务器发送包含验证码的 HTML 格式邮件到指定邮箱。
+
+    该函数会从环境配置中读取 SMTP 服务器信息（主机、端口、用户名、密码），
+    构建一封包含品牌样式的 HTML 邮件，将 6 位数字验证码嵌入邮件正文，
+    然后通过 SSL 加密连接发送到收件人邮箱。
 
     参数:
-        to_email: 收件人邮箱
-        code: 6位数字验证码
+        to_email (str): 收件人邮箱地址，用于接收验证码。
+        code (str): 6 位数字验证码字符串，将展示在邮件正文中。
 
     返回:
-        bool: 发送成功返回 True，失败返回 False
+        bool: 邮件发送成功返回 True；发送过程中出现任何异常则返回 False，
+              并在日志中记录错误详情。
     """
     try:
         settings = Settings.from_env()

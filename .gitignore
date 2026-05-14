@@ -96,14 +96,32 @@ data/jobs/
 *.local
 *.tmp
 
-# No-use directory (local temporary files)
-/no-use/
+*.ipynb
+/no-use
+/artifacts
+/src/nutrimaster/extraction/reports/
 
-# Temporary test files
+# 不要 add
+.plan.md
+playground/
+workspaces/
+
+/data-backup
+.eval_checkpoints/
+data/RAG_INDEX_REBUILD_20260510.md
+AGENTS.md
+CLAUDE.md
+DEPLOYMENT_*.md
+GIT_BRANCH_SUBMISSION_GUIDE.md
+INDEX_ROBUSTNESS.md
+admin_index_api_extension.py
+check_index_status.py
+process_zip_and_index.py
+quick_stats.py
+rebuild_index*.py
 test_*.py
-!test/
-check_and_fix.py
-configs.yml
-
-# Documentation files
-DEEPSEEK_V4_COMPATIBILITY.md
+tests/unit/*.py
+lib/
+others/
+data/index-backup-before-full-rebuild-20260510000511/
+EVOMASTER_EVAL_GUIDE.md

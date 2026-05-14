@@ -1,17 +1,17 @@
 """
-pipeline.py — Orchestrator with paper-level parallel processing.
+pipeline.py — 论文级并行处理的编排器。
 
-Each paper goes through:
-    API #1: extract_all_genes  → Title/Journal/DOI + gene arrays + gene_dict
-    API #2+: verify_all_genes  → verification + corrections (batched per 10 genes)
+每篇论文经过以下流程：
+    API #1: extract_all_genes  → 提取 Title/Journal/DOI + 基因数组 + gene_dict
+    API #2+: verify_all_genes  → 验证 + 修正（每 10 个基因一批）
 
-Papers are processed in parallel using ThreadPoolExecutor.
+论文之间使用 ThreadPoolExecutor 进行并行处理。
 
-Usage:
-    python -m extractor.pipeline               # full pipeline
-    python -m extractor.pipeline --test 1      # test: first file
-    python -m extractor.pipeline --test name   # test: match filename
-    python -m extractor.pipeline --workers 5   # custom parallelism
+用法：
+    python -m extractor.pipeline               # 完整管线
+    python -m extractor.pipeline --test 1      # 测试模式：第一个文件
+    python -m extractor.pipeline --test name   # 测试模式：匹配文件名
+    python -m extractor.pipeline --workers 5   # 自定义并行数
 """
 
 import argparse
@@ -35,8 +35,17 @@ def collect_paper_result(filename: str, result: dict, all_reports: list,
                          failed_files: list, skipped_files: list):
     """把单篇论文的处理结果分桶收集。
 
-    [PR 新增函数] 原来这段逻辑在 main() 的顺序和并行两处重复写，
-    现在提取为独立函数，按 status 分到 all_reports / skipped / failed 三个列表。
+    根据 result 中的 status 字段，将结果分类到三个列表中：
+    - "processed": 成功处理，将报告添加到 all_reports
+    - "skipped": 被跳过，将文件名添加到 skipped_files
+    - 其他: 处理失败，将文件名添加到 failed_files
+
+    Args:
+        filename: 论文文件名
+        result: 处理结果字典，包含 status 和可选的 report 字段
+        all_reports: 成功处理的报告收集列表（原地修改）
+        failed_files: 失败文件名收集列表（原地修改）
+        skipped_files: 跳过文件名收集列表（原地修改）
     """
     status = result.get("status", "failed")
     if status == "processed":
@@ -52,9 +61,16 @@ def collect_paper_result(filename: str, result: dict, all_reports: list,
 def resolve_test_files(files: list, test_index: str) -> list:
     """测试模式下筛选文件。
 
-    支持两种方式：
-    - 数字索引：--test 1 → 第1个文件
-    - 文件名匹配：--test Butelli → 模糊匹配含 "Butelli" 的文件
+    支持两种匹配方式：
+    - 数字索引：--test 1 → 选择第 1 个文件（1-based）
+    - 文件名匹配：--test Butelli → 先精确匹配，再模糊匹配含 "Butelli" 的文件
+
+    Args:
+        files: 所有可用的 Markdown 文件名列表
+        test_index: 测试模式参数，数字字符串或文件名模式
+
+    Returns:
+        list: 匹配到的文件名列表（通常只有 1 个），无匹配时返回空列表
     """
     if test_index.isdigit():
         idx = int(test_index) - 1
@@ -77,10 +93,14 @@ def resolve_test_files(files: list, test_index: str) -> list:
 
 
 def _print_paper_result(stem: str, result: dict):
-    """打印单篇论文的处理结果摘要（顺序和并行模式共用）。
+    """打印单篇论文的处理结果摘要。
 
-    [PR 新增函数] 原来顺序和并行模式各自写了一遍打印逻辑，现在统一。
-    显示 fidelity 准确率和 corrections 修正数。
+    顺序和并行模式共用此函数输出统一格式的结果。
+    显示 fidelity 准确率（SUPPORTED/总字段）和 corrections 修正数。
+
+    Args:
+        stem: 论文文件名 stem（不含扩展名）
+        result: 处理结果字典，包含 status 和 report 字段
     """
     status = result.get("status")
     if status == "processed":
@@ -95,10 +115,18 @@ def _print_paper_result(stem: str, result: dict):
 
 
 def process_one_paper(md_path: Path, stem: str, tracker: TokenTracker):
-    """处理单篇论文：提取 + 验证（线程安全）。[PR 改动] 使用 GENE_ARRAY_KEY_NAMES 替代硬编码
+    """处理单篇论文：提取 + 验证（线程安全）。
 
-    流程：extract_paper() → verify_paper() → 返回结果 dict
-    在 ThreadPoolExecutor 中并行调用，每篇论文独立处理。
+    流程：调用 extract_paper() 提取基因 → 调用 verify_paper() 验证 → 返回结果。
+    在 ThreadPoolExecutor 中并行调用，每篇论文独立处理，互不影响。
+
+    Args:
+        md_path: 论文 Markdown 文件的完整路径
+        stem: 论文文件名 stem（不含扩展名）
+        tracker: token 用量追踪器
+
+    Returns:
+        dict: 处理结果，包含 status（"processed"/"failed"/"skipped"）和 report 字段
     """
     try:
         extraction, gene_dict = extract_paper(md_path, tracker)
@@ -130,7 +158,11 @@ def process_one_paper(md_path: Path, stem: str, tracker: TokenTracker):
 def print_verify_summary(all_reports: list):
     """打印所有论文的验证汇总统计。
 
-    统计总字段数、SUPPORTED/UNSUPPORTED/UNCERTAIN 数量、修正数、整体准确率。
+    统计并输出全部论文的总字段数、SUPPORTED/UNSUPPORTED/UNCERTAIN
+    分布、总修正数和整体 fidelity 准确率。
+
+    Args:
+        all_reports: 所有成功处理的验证报告列表，每项包含 summary 字段
     """
     if not all_reports:
         return
@@ -163,7 +195,18 @@ def save_token_report(
     prefix: str = "pipeline",
     output_dir: Optional[Path] = None,
 ) -> Optional[str]:
-    """Persist the current token tracker and return the saved report path."""
+    """持久化当前 token 追踪器的用量报告。
+
+    将追踪器中记录的所有 API 调用 token 用量保存为带时间戳的 JSON 文件。
+
+    Args:
+        tracker: token 用量追踪器实例
+        prefix: 报告文件名前缀，默认 "pipeline"
+        output_dir: 报告输出目录，为 None 时使用配置中的 TOKEN_USAGE_DIR
+
+    Returns:
+        str: 保存的报告文件路径，无数据时返回 None
+    """
     if not tracker or not tracker.calls:
         return None
 
@@ -185,14 +228,37 @@ def run_pipeline_batch(
     on_paper_start: Optional[Callable[[str, int, int, bool], None]] = None,
     on_paper_done: Optional[Callable[[str, dict, int, int, bool], None]] = None,
 ) -> dict:
-    """Run a batch of papers using the shared extractor pipeline orchestration.
+    """执行一批论文的提取管线编排（CLI 和 Admin 共用核心）。
 
-    This is the reusable core for both CLI and `/admin`:
-    - CLI uses it for normal batch processing + terminal output
-    - admin uses it for SSE progress, stop checks, and token tracking
+    这是 CLI 命令行和 /admin 管理面板共享的可复用批处理核心：
+    - CLI 用于常规批量处理 + 终端输出
+    - Admin 用于 SSE 进度推送、停止检查和 token 追踪
 
-    The web layer stays responsible for auth/UI/index rebuild; extractor owns
-    the actual paper-processing loop and token-report inputs.
+    Web 层负责鉴权/UI/索引重建；本函数只负责论文处理循环和 token 报告。
+
+    根据文件数和 workers 自动选择顺序或并行模式：
+    - 单文件或 workers=1 → 顺序处理
+    - 多文件且 workers>1 → ThreadPoolExecutor 并行处理
+
+    Args:
+        files: 待处理的 Markdown 文件名列表
+        input_dir: 输入目录路径，为 None 时使用配置中的 INPUT_DIR
+        workers: 并行工作线程数，默认使用 MAX_WORKERS
+        tracker: token 用量追踪器，为 None 时自动创建
+        stop_requested: 可选的停止检查回调，返回 True 时提前终止
+        on_paper_start: 论文开始处理时的回调
+        on_paper_done: 论文处理完成时的回调
+
+    Returns:
+        dict: 包含以下键的结果字典：
+            - tracker: TokenTracker 实例
+            - all_reports: 成功处理的验证报告列表
+            - failed_files: 失败的文件名列表
+            - skipped_files: 跳过的文件名列表
+            - stopped: 是否被提前停止
+            - submitted: 已提交/处理的文件数
+            - done: 已完成的文件数
+            - total: 总文件数
     """
     input_dir = Path(input_dir or INPUT_DIR)
     tracker = tracker or TokenTracker(model=EXTRACTOR_MODEL)
@@ -267,7 +333,14 @@ def run_pipeline_batch(
 
 
 def main():
-    """Pipeline 主函数：解析参数 → 发现文件 → 顺序/并行处理 → 汇总输出。[PR 改动] 拆出 collect_paper_result/_print_paper_result"""
+    """提取管线主函数：解析命令行参数 → 发现文件 → 顺序/并行处理 → 汇总输出。
+
+    支持的参数：
+    - --test: 测试模式，指定文件索引或文件名模式
+    - --workers: 并行工作线程数
+
+    也支持环境变量 TEST_MODE=1 和 TEST_INDEX 进入测试模式。
+    """
     parser = argparse.ArgumentParser(description="NutriMaster Extraction Pipeline")
     parser.add_argument("--test", type=str, default=None,
                         help="Test mode: file index (1-based) or filename pattern")
@@ -309,6 +382,14 @@ def main():
     tracker = TokenTracker(model=EXTRACTOR_MODEL)
 
     def _on_paper_start(filename: str, index: int, total: int, parallel: bool):
+        """论文开始处理时的 CLI 回调，顺序模式下打印单篇头部分隔线。
+
+        Args:
+            filename: 当前处理的文件名
+            index: 当前文件的索引（0-based）
+            total: 总文件数
+            parallel: 是否为并行模式
+        """
         # CLI 只在顺序模式下打印单篇头部，避免并行日志互相打乱。
         if not parallel:
             print(f"\n{'━' * 60}")
@@ -316,6 +397,15 @@ def main():
             print(f"{'━' * 60}")
 
     def _on_paper_done(filename: str, result: dict, done: int, total: int, parallel: bool):
+        """论文处理完成时的 CLI 回调，打印结果摘要。
+
+        Args:
+            filename: 已处理的文件名
+            result: 处理结果字典
+            done: 已完成的文件数
+            total: 总文件数
+            parallel: 是否为并行模式
+        """
         stem = Path(filename).stem
         _print_paper_result(stem, result)
 

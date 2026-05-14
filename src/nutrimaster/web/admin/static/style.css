@@ -419,6 +419,110 @@ body {
     color: var(--text-secondary);
 }
 
+/* ─── Index Status Card ───────────────────────────────────────────────────── */
+
+.index-status-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 24px;
+    margin-bottom: 24px;
+}
+
+.index-status-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+.index-status-header h3 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.index-stats {
+    display: grid;
+    gap: 12px;
+    margin-bottom: 20px;
+}
+
+.index-stat-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(48, 54, 61, 0.5);
+}
+
+.index-stat-row:last-child {
+    border-bottom: none;
+}
+
+.index-label {
+    font-size: 14px;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.index-value {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--text-primary);
+}
+
+#rebuild-index-btn {
+    width: 100%;
+    margin-top: 8px;
+}
+
+.btn-ghost-sm {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    padding: 6px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.btn-ghost-sm:hover {
+    border-color: var(--text-muted);
+    color: var(--text-primary);
+}
+
+.badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+}
+
+.badge.badge-success {
+    background: var(--accent-dim);
+    color: var(--accent);
+}
+
+.badge.badge-warning {
+    background: rgba(210, 153, 34, 0.15);
+    color: var(--accent-orange);
+}
+
+.badge.badge-error {
+    background: var(--accent-red-dim);
+    color: var(--accent-red);
+}
+
+.badge.badge-info {
+    background: var(--accent-blue-dim);
+    color: var(--accent-blue);
+}
+
+
 .status-banner {
     display: flex;
     align-items: center;

@@ -268,8 +268,96 @@ async function refreshDashboard() {
         } else {
             banner.style.display = 'none';
         }
+
+        // 同时刷新索引状态
+        await refreshIndexStatus();
     } catch (e) { console.error('Dashboard error:', e); }
 }
+
+/**
+ * 刷新 RAG 索引状态卡片
+ */
+async function refreshIndexStatus() {
+    try {
+        const resp = await fetch(ADMIN_BASE + '/api/index/status', { headers: authHeaders() });
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        // 更新文件统计
+        document.getElementById('index-files').textContent =
+            `${data.indexed_files.toLocaleString()} / ${data.total_files.toLocaleString()}`;
+
+        // 更新 chunks 数量
+        document.getElementById('index-chunks').textContent =
+            data.total_chunks ? data.total_chunks.toLocaleString() : '--';
+
+        // 更新最后更新时间
+        if (data.last_updated) {
+            const date = new Date(data.last_updated);
+            document.getElementById('index-updated').textContent =
+                date.toLocaleString('en-US', {
+                    month: 'short',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+        } else {
+            document.getElementById('index-updated').textContent = 'Never';
+        }
+
+        // 更新状态徽章
+        const statusBadge = document.getElementById('index-status');
+        if (data.is_synced) {
+            statusBadge.textContent = '✅ Synced';
+            statusBadge.className = 'badge badge-success';
+        } else {
+            statusBadge.textContent = `⚠️ ${data.missing_files} files missing`;
+            statusBadge.className = 'badge badge-warning';
+        }
+    } catch (e) {
+        console.error('Index status error:', e);
+    }
+}
+
+/**
+ * 手动触发索引重建
+ */
+async function rebuildIndex() {
+    const btn = document.getElementById('rebuild-index-btn');
+    const originalText = btn.textContent;
+
+    if (!confirm('Rebuild the RAG index? This may take several minutes to hours depending on the number of missing files.')) {
+        return;
+    }
+
+    try {
+        btn.disabled = true;
+        btn.textContent = '🔄 Rebuilding...';
+
+        const resp = await fetch(ADMIN_BASE + '/api/index/rebuild', {
+            method: 'POST',
+            headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ force: false, async: true })
+        });
+
+        if (!resp.ok) {
+            throw new Error('Failed to start index rebuild');
+        }
+
+        const data = await resp.json();
+        alert(data.message || 'Index rebuild started in background');
+
+        // 5秒后刷新状态
+        setTimeout(() => refreshIndexStatus(), 5000);
+    } catch (e) {
+        console.error('Rebuild error:', e);
+        alert('Failed to start index rebuild: ' + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+    }
+}
+
 
 // ═════════════════════════════════════════════════════════════════════
 //  Upload — ZIP 上传
@@ -333,6 +421,11 @@ function renderUploadResult(data) {
     if (data.new_files.length) {
         html += `<div><span class="count-good">${data.new_files.length}</span> new files added to input queue</div>`;
         html += `<div class="file-list">${data.new_files.join('<br>')}</div>`;
+        // 添加提示：运行 Pipeline 会自动更新索引
+        html += `<div style="margin-top:16px;padding:12px;background:var(--accent-blue-dim);border:1px solid var(--accent-blue);border-radius:var(--radius-sm);font-size:13px;">
+            <strong>💡 Next step:</strong> Go to the <strong>Pipeline</strong> tab and run the extraction.
+            The RAG index will be automatically updated after processing completes.
+        </div>`;
     }
     if (data.skipped_processed.length) {
         html += `<div style="margin-top:10px"><span class="count-skip">${data.skipped_processed.length}</span> skipped (already in data)</div>`;
@@ -517,18 +610,20 @@ function connectSSE() {
 
     // 正在重建 RAG 索引
     sseSource.addEventListener('rebuilding_index', () => {
-        addLogLine('Rebuilding RAG index...', 'info');
+        addLogLine('🔄 Rebuilding RAG index...', 'info');
     });
 
     // 索引重建成功
     sseSource.addEventListener('index_rebuilt', () => {
-        addLogLine('RAG index rebuilt successfully', 'success');
+        addLogLine('✅ RAG index rebuilt successfully', 'success');
+        // 刷新索引状态显示
+        setTimeout(() => refreshIndexStatus(), 1000);
     });
 
     // 索引重建失败
     sseSource.addEventListener('index_error', (e) => {
         const d = JSON.parse(e.data);
-        addLogLine(`Index rebuild failed: ${d.error}`, 'fail');
+        addLogLine(`❌ Index rebuild failed: ${d.error}`, 'fail');
     });
 
     // 全部完成

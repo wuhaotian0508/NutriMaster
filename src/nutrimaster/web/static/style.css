@@ -1277,6 +1277,73 @@ body {
     margin-top: 6px;
 }
 
+/* ===== 思考过程 ===== */
+.thinking-container {
+    font-size: 12px;
+    color: var(--text-light);
+    margin-bottom: 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: #FEFCE8;
+    overflow: hidden;
+}
+
+.thinking-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    cursor: pointer;
+    user-select: none;
+    background: #FEF9C3;
+    transition: background 0.2s;
+}
+
+.thinking-header:hover {
+    background: #FEF08A;
+}
+
+.thinking-header-text {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
+    color: #854D0E;
+}
+
+.thinking-toggle {
+    font-size: 10px;
+    color: #A16207;
+    transition: transform 0.2s;
+}
+
+.thinking-container.expanded .thinking-toggle {
+    transform: rotate(90deg);
+}
+
+.thinking-content {
+    display: none;
+    padding: 8px 10px;
+    font-size: 11px;
+    color: #713F12;
+    background: #FFFBEB;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.thinking-container.expanded .thinking-content {
+    display: block;
+}
+
+.thinking-content pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+    font-size: 11px;
+    line-height: 1.5;
+}
+
 .tool-call-result summary {
     cursor: pointer;
     color: var(--primary-color);
