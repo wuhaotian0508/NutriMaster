@@ -3,11 +3,25 @@
 """
 
 import json
+from pathlib import Path
 from typing import Any
 
 
 class LocalStorage:
     """本地 JSONL 文件读写"""
+
+    @staticmethod
+    def save_questions(filepath: str, questions: list[dict[str, Any]]):
+        """
+        保存题目到本地 JSONL 文件
+
+        questions 格式: [{"编号": 1, "正文": "...", "采分点": [...], ...}, ...]
+        """
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            for question in questions:
+                f.write(json.dumps(question, ensure_ascii=False) + "\n")
 
     @staticmethod
     def load_questions(filepath: str, max_questions: int = 0) -> list[dict[str, Any]]:
@@ -36,7 +50,9 @@ class LocalStorage:
 
         results 格式: [{"题目编号": 1, "答案": "...", "总分": 8.5, ...}, ...]
         """
-        with open(filepath, "w", encoding="utf-8") as f:
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
             for result in results:
                 f.write(json.dumps(result, ensure_ascii=False) + "\n")
 

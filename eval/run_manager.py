@@ -303,7 +303,7 @@ class RunManager:
         if resume:
             completed = self.load_checkpoint(agent_name, version)
             if completed:
-                print(f"📂 加载检查点: 已完成 {len(completed)} 题")
+                print(f"📂 加载检查点: 已完成 {len(completed)} 题", flush=True)
 
         # 2. 过滤剩余题目
         remaining = self.filter_remaining_questions(
@@ -311,44 +311,49 @@ class RunManager:
         )
 
         if not remaining:
-            print("✅ 所有题目已完成")
+            print("✅ 所有题目已完成", flush=True)
             return list(completed.values())
 
-        print(f"🔄 剩余 {len(remaining)} 题待评测")
+        print(
+            f"🔄 {agent_name}/{version}: 总题目 {len(questions)}，"
+            f"已完成 {len(completed)}，剩余 {len(remaining)}，"
+            f"并发 {self.max_concurrency}",
+            flush=True,
+        )
 
-        # 3. 运行评测（自动保存）
-        new_results = []
-        for i, q in enumerate(remaining, 1):
-            try:
-                result = await self.run_with_retry(eval_fn, q)
-                new_results.append(result)
+        async def _eval_one(i: int, q: dict[str, Any]) -> dict[str, Any]:
+            q_id = q.get("编号")
+            async with self.semaphore:
+                print(f"▶️  [{i}/{len(remaining)}] 开始题目 {q_id}", flush=True)
+                try:
+                    result = await self.run_with_retry(eval_fn, q)
+                    print(f"✅ [{i}/{len(remaining)}] 完成题目 {q_id}", flush=True)
+                    return result
+                except Exception as e:
+                    print(f"❌ [{i}/{len(remaining)}] 题目 {q_id} 失败: {e}", flush=True)
+                    return {
+                        "题目编号": q_id,
+                        "Agent名称": agent_name,
+                        "版本": version,
+                        "答案": "",
+                        "总分": 0.0,
+                        "满分": sum(r.get("满分", 0) for r in q.get("采分点", [])),
+                        "error": str(e),
+                    }
 
-                # 自动保存
-                if i % self.auto_save_interval == 0:
-                    self.save_checkpoint(agent_name, version, new_results, append=True)
-                    new_results = []
-                    print(f"💾 自动保存检查点 ({i}/{len(remaining)})")
+        # 3. 并发运行评测；每完成一题立即写 checkpoint，避免中断丢进度。
+        tasks = [
+            asyncio.create_task(_eval_one(i, q))
+            for i, q in enumerate(remaining, 1)
+        ]
+        saved = 0
+        for finished in asyncio.as_completed(tasks):
+            result = await finished
+            self.save_checkpoint(agent_name, version, [result], append=True)
+            saved += 1
+            print(f"💾 已保存检查点 ({saved}/{len(remaining)})", flush=True)
 
-            except Exception as e:
-                print(f"❌ 题目 {q.get('编号')} 失败: {e}")
-                # 保存失败记录
-                error_result = {
-                    "题目编号": q.get("编号"),
-                    "Agent名称": agent_name,
-                    "版本": version,
-                    "答案": "",
-                    "总分": 0.0,
-                    "满分": sum(r.get("满分", 0) for r in q.get("采分点", [])),
-                    "error": str(e),
-                }
-                new_results.append(error_result)
-
-        # 4. 保存剩余结果
-        if new_results:
-            self.save_checkpoint(agent_name, version, new_results, append=True)
-            print(f"💾 保存最终检查点")
-
-        # 5. 返回所有结果
+        # 4. 返回所有结果
         all_completed = self.load_checkpoint(agent_name, version)
         return list(all_completed.values())
 

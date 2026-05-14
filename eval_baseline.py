@@ -13,6 +13,7 @@ import re
 import threading
 import time
 from typing import Any, Callable
+from tqdm.auto import tqdm
 
 import dotenv
 from notion_client import Client as NotionClient
@@ -22,6 +23,9 @@ from openai import AsyncOpenAI
 dotenv.load_dotenv(".env.local")
 dotenv.load_dotenv()
 dotenv.load_dotenv(".eval_env", override=True)
+
+
+
 
 
 # ===== 配置 =====
@@ -123,21 +127,22 @@ def fetch_questions() -> list[dict[str, Any]]:
     questions = []
     data_source_id = resolve_data_source_id(QUESTION_DB_ID)
     start_cursor = None
+    with tqdm(desc='读取notion题目',unit='题') as pbar:
+        while True:
+            kwargs: dict[str, Any] = {"data_source_id": data_source_id, "page_size": 100}
+            if start_cursor:
+                kwargs["start_cursor"] = start_cursor
 
-    while True:
-        kwargs: dict[str, Any] = {"data_source_id": data_source_id, "page_size": 100}
-        if start_cursor:
-            kwargs["start_cursor"] = start_cursor
+            response = notion.data_sources.query(**kwargs)
+            pages=response["results"]
+            for page in pages:
+                question = parse_question(page)
+                if question["正文"]:
+                    questions.append(question)
 
-        response = notion.data_sources.query(**kwargs)
-        for page in response["results"]:
-            question = parse_question(page)
-            if question["正文"]:
-                questions.append(question)
-
-        if not response.get("has_more"):
-            break
-        start_cursor = response.get("next_cursor")
+            if not response.get("has_more"):
+                break
+            start_cursor = response.get("next_cursor")
 
     print(f"读取题目: {len(questions)} 道")
     return questions
@@ -155,6 +160,7 @@ def parse_question(page: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "page_id": page["id"],
+        "创建时间": page.get("created_time"),
         "编号": props.get("题目编号", {}).get("unique_id", {}).get("number", 0),
         "标题": get_title(props, "题目标题"),
         "正文": get_text(props, "题目正文"),

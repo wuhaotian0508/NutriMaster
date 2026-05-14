@@ -15,12 +15,19 @@ class LLMJudge:
 
     def __init__(self, model: str, base_url: str = None, api_key: str = None):
         self.model = model
+        self.stream = os.getenv("JUDGE_STREAM", "0").lower() in {"1", "true", "yes"}
         self.client = AsyncOpenAI(
             base_url=base_url or os.getenv("LLM_BASE_URL", "https://api.gpugeek.com/v1"),
             api_key=api_key or os.getenv("LLM_API_KEY"),
         )
 
-    async def judge(self, question: str, answer: str, rubrics: list[dict[str, Any]]) -> dict[str, Any]:
+    async def judge(
+        self,
+        question: str,
+        answer: str,
+        rubrics: list[dict[str, Any]],
+        reference_answer: str = "",
+    ) -> dict[str, Any]:
         """
         评分
 
@@ -42,32 +49,48 @@ class LLMJudge:
 
         try:
             # 构建评分提示词
-            prompt = self._build_prompt(question, answer, rubrics)
+            prompt = self._build_prompt(question, answer, rubrics, reference_answer)
 
             # 调用 LLM 评分
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
+                max_tokens=16384,
+                temperature=0.1,
+                stream=self.stream,
             )
 
-            judge_output = response.choices[0].message.content or ""
+            if self.stream:
+                chunks = []
+                async for chunk in response:
+                    if chunk.choices:
+                        chunks.append(chunk.choices[0].delta.content or "")
+                judge_output = "".join(chunks)
+            else:
+                judge_output = response.choices[0].message.content or ""
 
             # 解析评分结果
-            score, details = self._parse_output(judge_output)
+            score, details, rubric_scores = self._parse_output(judge_output, rubrics)
 
             return {
                 "ok": True,
                 "总分": score,
                 "满分": max_score,
                 "评分详情": details,
+                "采分点得分": rubric_scores,
                 "error": None,
             }
 
         except Exception as e:
-            return {"ok": False, "总分": 0.0, "满分": max_score, "评分详情": "", "error": str(e)}
+            return {"ok": False, "总分": 0.0, "满分": max_score, "评分详情": "", "采分点得分": [], "error": str(e)}
 
-    def _build_prompt(self, question: str, answer: str, rubrics: list[dict[str, Any]]) -> str:
+    def _build_prompt(
+        self,
+        question: str,
+        answer: str,
+        rubrics: list[dict[str, Any]],
+        reference_answer: str = "",
+    ) -> str:
         """构建评分提示词"""
         rubric_text = "\n".join(
             f"{i}. {r['描述']} (满分: {r['满分']})" for i, r in enumerate(rubrics, 1)
@@ -77,6 +100,9 @@ class LLMJudge:
 
 **题目：**
 {question}
+
+**参考答案：**
+{reference_answer or "（无）"}
 
 **采分点：**
 {rubric_text}
@@ -103,23 +129,37 @@ class LLMJudge:
 
 请严格按照 JSON 格式输出，不要添加其他内容。"""
 
-    def _parse_output(self, judge_output: str) -> tuple[float, str]:
+    def _parse_output(self, judge_output: str, rubrics: list[dict[str, Any]]) -> tuple[float, str, list[float]]:
         """
         解析 LLM 评分输出
 
         返回: (总分, 评分详情文本)
         """
-        # 提取 JSON
-        json_match = re.search(r"```json\s*(\{.*?\})\s*```", judge_output, re.DOTALL)
-        if not json_match:
-            json_match = re.search(r"\{.*?\}", judge_output, re.DOTALL)
+        # 提取完整 JSON；评分结果内有嵌套对象，不能用非贪婪括号正则。
+        json_match = re.search(r"```json\s*(.*?)\s*```", judge_output, re.DOTALL)
+        if json_match:
+            json_text = json_match.group(1).strip()
+        else:
+            start = judge_output.find("{")
+            end = judge_output.rfind("}")
+            json_text = judge_output[start : end + 1].strip() if start != -1 and end != -1 and end > start else ""
 
-        if not json_match:
-            return 0.0, f"无法解析评分结果：{judge_output[:200]}"
+        if not json_text:
+            raise ValueError(f"无法解析评分结果：{judge_output[:200]}")
 
         try:
-            result = json.loads(json_match.group(1) if json_match.groups() else json_match.group(0))
-            score = float(result.get("总分", 0))
+            result = json.loads(json_text)
+            rubric_scores = []
+            for i, (rubric_score, rubric) in enumerate(zip(result.get("采分点评分", []), rubrics), start=1):
+                raw_score = float(rubric_score.get("得分", 0))
+                max_score = float(rubric.get("满分", 0))
+                rubric_scores.append(min(max(raw_score, 0.0), max_score))
+                rubric_score.setdefault("编号", i)
+
+            if len(rubric_scores) != len(rubrics):
+                raise ValueError(f"Judge 返回 {len(rubric_scores)} 个采分点分数，期望 {len(rubrics)} 个")
+
+            score = round(sum(rubric_scores), 4)
 
             # 格式化评分详情
             details_lines = [f"总评: {result.get('总评', '')}"]
@@ -128,10 +168,10 @@ class LLMJudge:
                     f"采分点{rubric_score['编号']}: {rubric_score['得分']}分 - {rubric_score['理由']}"
                 )
 
-            return score, "\n".join(details_lines)
+            return score, "\n".join(details_lines), rubric_scores
 
         except (json.JSONDecodeError, ValueError) as e:
-            return 0.0, f"JSON 解析失败: {e}"
+            raise ValueError(f"JSON 解析失败: {e}") from e
 
     async def close(self):
         """关闭客户端"""
