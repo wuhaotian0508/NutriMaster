@@ -6,11 +6,10 @@ import shutil
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-
-from nutrimaster.crispr import accession2sequence as step2_acc2seq
-from nutrimaster.crispr import crispr_target as step3_crispr
-from nutrimaster.crispr import experiment_design as step4_design
-from nutrimaster.crispr import gene2accession as step1_gene2acc
+from nutrimaster.experiment.crispr import gene2accession as step1_gene2acc
+from nutrimaster.experiment.crispr import accession2sequence as step2_acc2seq
+from nutrimaster.experiment.crispr import crispr_target as step3_crispr
+from nutrimaster.experiment.crispr import experiment_design as step4_design
 from nutrimaster.config.llm import call_llm_sync
 
 logger = logging.getLogger(__name__)
@@ -130,31 +129,21 @@ class ExperimentPipeline:
         try:
             gene_names = ", ".join(gene["gene"] for gene in genes)
 
-            yield {
-                "type": "progress",
-                "step": 1,
-                "total": 4,
-                "msg": f"正在查询 NCBI 获取 accession（{gene_names}）...",
-            }
-            acc_file = step1_gene2acc.run_gene2accession(genes, self.work_dir)
-            yield {"type": "progress", "step": 1, "total": 4, "msg": "Accession 查询完成"}
+            yield {"type": "progress", "step": 1, "total": 4, "msg": f"正在查询 NCBI 获取 accession（{gene_names}）..."}
+            acc_files = step1_gene2acc.run_gene2accession(genes, self.work_dir)
+            yield {"type": "progress", "step": 1, "total": 4, "msg": "Accession 查询完成", "done": True}
 
             yield {"type": "progress", "step": 2, "total": 4, "msg": "正在从 NCBI 下载基因序列..."}
-            fasta = step2_acc2seq.run_accession2sequence(acc_file, self.work_dir)
-            yield {"type": "progress", "step": 2, "total": 4, "msg": "序列下载完成"}
+            fasta_files = step2_acc2seq.run_accession2sequence(acc_files, self.work_dir)
+            yield {"type": "progress", "step": 2, "total": 4, "msg": "序列下载完成", "done": True}
 
-            yield {
-                "type": "progress",
-                "step": 3,
-                "total": 4,
-                "msg": "正在设计 CRISPR 靶点（可能需要 10-30 秒）...",
-            }
-            targets = step3_crispr.run_crispr_target(fasta, self.work_dir)
-            yield {"type": "progress", "step": 3, "total": 4, "msg": "CRISPR 靶点设计完成"}
+            yield {"type": "progress", "step": 3, "total": 4, "msg": "正在设计 CRISPR 靶点（可能需要 10-30 秒）..."}
+            target_files = step3_crispr.run_crispr_target(fasta_files, self.work_dir)
+            yield {"type": "progress", "step": 3, "total": 4, "msg": "CRISPR 靶点设计完成", "done": True}
 
             yield {"type": "progress", "step": 4, "total": 4, "msg": "正在生成实验方案 SOP..."}
-            sops = step4_design.run_experiment_design(targets, self.work_dir, acc_file)
-            yield {"type": "progress", "step": 4, "total": 4, "msg": "实验方案生成完成"}
+            sops = step4_design.run_experiment_design(fasta_files, target_files, self.work_dir)
+            yield {"type": "progress", "step": 4, "total": 4, "msg": "实验方案生成完成", "done": True}
             yield {"type": "result", "sops": sops}
         except Exception as exc:
             logger.exception("实验方案 pipeline 执行出错")

@@ -21,30 +21,37 @@ NutriMaster 是一个面向植物营养与代谢基因知识库的抽取、检�
 │   ├── index/              # 全局 RAG 索引产物
 │   ├── personal_lib/       # 用户上传 PDF 和个人索引
 │   └── user_skills/        # 用户自定义技能
-├── src/nutrimaster/extraction/              # Markdown -> 抽取 JSON -> verified JSON 流水线
-│   ├── input/              # 待处理 Markdown
-│   ├── prompts/            # 抽取 prompt 和 JSON schema
-│   ├── reports/            # 抽取、验证和 token 报告
-│   ├── config.py
-│   ├── extract.py
-│   ├── verify.py
-│   ├── pipeline.py
-│   └── run.sh
-├── src/
-│   ├── admin/              # Flask Admin 面板，可挂载到 Web 应用
-│   ├── agent/              # Agent runtime、工具、技能和策略
-│   ├── app/                # Agent stack 组装
-│   ├── cli/                # 轻量 CLI 入口
-│   ├── crispr/             # CRISPR 设计和 SOP 生成流水线
-│   ├── domain/             # Paper/Gene 领域模型
-│   ├── indexing/           # 分块与增量索引逻辑
-│   ├── retrieval/          # Jina 检索、重排、翻译、个人库
-│   ├── server/             # FastAPI Web/API、认证、邮件、静态前端
-│   ├── shared/             # 配置和共享 LLM helper
-│   ├── skills/             # 系统内置技能
-│   ├── storage/            # 主语料 repository 抽象
-│   └── tools/              # Agent 使用的工具实现
+├── src/nutrimaster/
+│   ├── extraction/         # Markdown → 抽取 JSON → verified JSON 流水线
+│   │   ├── input/          # 待处理 Markdown
+│   │   ├── output/         # 临时抽取输出
+│   │   ├── prompts/        # 抽取 prompt 和 JSON schema（v5）
+│   │   ├── reports/        # 抽取、验证和 token 报告
+│   │   ├── config.py
+│   │   ├── extract.py
+│   │   ├── verify.py
+│   │   ├── pipeline.py
+│   │   └── run.sh
+│   ├── rag/                # RAG 分块、向量化和检索
+│   │   ├── chunking.py
+│   │   ├── incremental_indexer.py
+│   │   ├── index_service.py
+│   │   └── jina_retriever.py
+│   ├── agent/              # Agent runtime、工具和技能
+│   │   ├── tools/
+│   │   └── skills/
+│   ├── web/                # FastAPI Web 应用
+│   │   ├── app.py
+│   │   ├── routes/
+│   │   ├── admin/          # Flask Admin 面板（挂载于 /admin）
+│   │   └── static/
+│   ├── config/             # 集中配置（settings.py）
+│   ├── auth/               # Supabase 认证集成
+│   └── experiment/         # 实验功能（CRISPR、基因转化）
+├── eval/                   # 评测框架
+├── graphing/               # 基因图谱可视化工具
 ├── tests/                  # 单元、集成和 e2e 测试
+├── logs/
 ├── DEVELOPMENT.md          # 协作开发与维护指南
 ├── pyproject.toml
 └── .env.example
@@ -234,10 +241,10 @@ uv run nutrimaster extract --rerun
 
 全局检索主要由以下模块组成：
 
-- `src/indexing/chunking.py`
-- `src/indexing/incremental_indexer.py`
-- `src/indexing/index_service.py`
-- `src/retrieval/jina_retriever.py`
+- `src/nutrimaster/rag/chunking.py`
+- `src/nutrimaster/rag/incremental_indexer.py`
+- `src/nutrimaster/rag/index_service.py`
+- `src/nutrimaster/rag/jina_retriever.py`
 
 索引器扫描 `RAG_DATA_DIR` 下的 `*_nutri_plant_verified.json`，生成结构化 gene chunks，调用 Jina embedding，并写入：
 
@@ -278,12 +285,20 @@ uv sync --dev
 
 ## CRISPR 和 SOP 生成
 
-CRISPR 相关逻辑位于 `src/crispr/`，通过 Agent 工具和 Web 路由暴露。它支持 gene/accession 查询、靶点设计、实验方案规划和物种特异 SOP 格式化。
+CRISPR 相关逻辑位于 `src/nutrimaster/experiment/crispr/`，通过 Agent 工具和 Web 路由暴露。它支持 gene/accession 查询、靶点设计、实验方案规划和物种特异 SOP 格式化。
 
 模板位于：
 
 ```text
-src/crispr/templates/
+src/nutrimaster/experiment/crispr/templates/
+```
+
+转基因 相关逻辑位于 `src/nutrimaster/experiment/gene_transfer/`，通过 Agent 工具和 Web 路由暴露。它支持 gene/accession 查询、上下游序列截取、实验方案规划和物种特异 SOP 格式化。
+
+模板位于：
+
+```text
+src/nutrimaster/experiment/gene_transfer/templates/
 ```
 
 ## 测试
@@ -336,11 +351,11 @@ DEVELOPMENT.md
 ## 开发注意事项
 
 - `pyproject.toml` 中安装包名为 `nutrimaster`，命令行入口为 `nutrimaster`。
-- Python 模块直接从 `src/` 下作为顶层包导入，例如 `server`、`admin`、`retrieval`、`indexing`、`agent`。
+- 所有 Python 模块均位于 `src/nutrimaster/` 包下，通过 `from nutrimaster.xxx import ...` 导入。
 - `data/corpus/` 是主语料；`data/index/` 是可再生成的索引状态。
 - `data/personal_lib/` 和 `data/user_skills/` 是用户运行时数据。
 - `src/nutrimaster/extraction/input/processed/`、`src/nutrimaster/extraction/output/`、token 报告、个人库、用户技能、日志和索引二进制产物默认不应提交。
-- Admin 和 `src/nutrimaster/extraction/run.sh` 默认使用 v5 prompt/schema；直接 import `extractor.config` 时会使用该文件自身默认值，必要时用环境变量显式覆盖。
+- Admin 和 `src/nutrimaster/extraction/run.sh` 默认使用 v5 prompt/schema；直接 import `nutrimaster.extraction.config` 时会使用该文件自身默认值，必要时用环境变量显式覆盖。
 - 生成新 verified JSON 时务必保持 `JSON_DIR=./data/corpus`。
 
 ## 典型本地流程

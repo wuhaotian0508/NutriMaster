@@ -246,38 +246,50 @@ def _find_accession_for_gene(gene_name: str, species: str, pause: float = 0.34) 
     return _pick_best_accession(direct_records, gene_name)
 
 
-def run_gene2accession(genes: list[dict], work_dir: Path) -> Path:
-    """批量查询基因列表对应的 NCBI 核酸 accession 编号，并将结果写入文件。
+def run_gene2accession(genes: list[dict], work_dir: Path) -> list[Path]:
+    """批量查询基因列表对应的 NCBI 核酸 accession 编号，按物种分别写入文件。
 
     对每个基因调用 NCBI Entrez API 查找 accession，结果以 TSV 格式（基因名\\t物种\\taccession）
-    写入 work_dir/accession.txt 文件。
+    按物种写入 work_dir/{species}_accession.txt 文件（物种名中空格替换为下划线）。
 
     Args:
         genes: 基因信息字典列表，每个字典需包含 "gene"（基因名）和 "species"（物种名）。
         work_dir: 工作目录，输出文件将写入此目录。
 
     Returns:
-        Path: 生成的 accession 文件路径（work_dir/accession.txt）。
+        list[Path]: 生成的各物种 accession 文件路径列表。
 
     Raises:
         ValueError: 所有基因均未能找到 accession 时抛出。
     """
     Entrez.email = _ENTREZ_EMAIL
-    acc_file = work_dir / "accession.txt"
     results = []
     for gene in genes:
+        normalized_species = _normalize_species_name(gene["species"])
         try:
             accession = _find_accession_for_gene(gene["gene"], gene["species"])
         except Exception as exc:
             logger.warning("Gene %s accession lookup failed: %s", gene["gene"], exc)
             accession = ""
-        results.append((gene["gene"], gene["species"], accession))
-    with acc_file.open("w", encoding="utf-8") as file:
-        for gene_name, species, accession in results:
-            file.write(f"{gene_name}\t{species}\t{accession}\n")
+        results.append((gene["gene"], normalized_species, accession))
+
     if not any(result[2] for result in results):
         raise ValueError("未能为任何基因找到 NCBI accession")
-    return acc_file
+
+    species_groups: dict[str, list[tuple[str, str, str]]] = {}
+    for row in results:
+        species_groups.setdefault(row[1], []).append(row)
+
+    output_files = []
+    for species, rows in species_groups.items():
+        filename = species.replace(" ", "_") + "_accession.txt"
+        acc_file = work_dir / filename
+        with acc_file.open("w", encoding="utf-8") as file:
+            for gene_name, sp, accession in rows:
+                file.write(f"{gene_name}\t{sp}\t{accession}\n")
+        output_files.append(acc_file)
+
+    return output_files
 
 
 __all__ = [

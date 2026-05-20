@@ -15,7 +15,7 @@ from nutrimaster.agent.skills import SkillLoader
 from nutrimaster.agent.tools import ExperimentDesignTool, RagSearchTool, ToolRegistry
 from nutrimaster.config.llm import call_llm
 from nutrimaster.config.settings import Settings
-from nutrimaster.experiment import ExperimentDesignService
+from nutrimaster.experiment import ExperimentDesignService, GeneTransferDesignService
 from nutrimaster.rag.jina import JinaRetriever
 from nutrimaster.rag.personal_library import PersonalLibrary
 from nutrimaster.rag.service import (
@@ -55,6 +55,7 @@ class WebServices:
     agent: Agent
     interaction_recorder: InteractionRecorder
     experiment_service: ExperimentDesignService
+    gene_transfer_service: GeneTransferDesignService
     personal_libs: TTLCache = field(default_factory=lambda: TTLCache(maxsize=200, ttl=3600))
     personal_libs_lock: threading.Lock = field(default_factory=threading.Lock)
     reindex_state: ReindexState = field(default_factory=ReindexState)
@@ -136,6 +137,7 @@ def create_services(settings: Settings | None = None) -> WebServices:
 
     registry = ToolRegistry()
     experiment_service = ExperimentDesignService()
+    gene_transfer_service = GeneTransferDesignService()
     rag_service = RAGSearchService(
         pubmed_source=PubMedSource(),
         gene_db_source=GeneDbSource(retriever),
@@ -144,7 +146,7 @@ def create_services(settings: Settings | None = None) -> WebServices:
             get_query_embedding=retriever.get_query_embedding,
         ),
     )
-    for tool in (RagSearchTool(rag_service), ExperimentDesignTool(experiment_service)):
+    for tool in (RagSearchTool(rag_service), ExperimentDesignTool(experiment_service, gene_transfer_service)):
         registry.register(tool)
     skill_loader = SkillLoader()
 
@@ -156,6 +158,7 @@ def create_services(settings: Settings | None = None) -> WebServices:
         agent=Agent(registry=registry, skill_loader=skill_loader, call_llm=call_llm),
         interaction_recorder=InteractionRecorder.from_settings(settings),
         experiment_service=experiment_service,
+        gene_transfer_service=gene_transfer_service,
     )
     holder["services"] = services
     return services

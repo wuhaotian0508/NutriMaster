@@ -87,21 +87,77 @@ async def experiment_run(
         raise HTTPException(status_code=400, detail="缺少 genes 列表")
 
     async def generate():
-        """SSE 流式事件生成器。
-
-        逐步推送实验执行的进度信息和最终生成的 SOP 结果。
-        异常时推送 error 事件。
-
-        生成:
-            str: 格式化的 SSE 数据字符串。
-        """
         try:
-            yield sse({"type": "progress", "step": 1, "total": 1, "msg": "正在执行一键实验 pipeline..."})
-            sops = await services.experiment_service.run(genes=genes)
-            yield sse({"type": "result", "sops": sops})
+            async for event in services.experiment_service.run(genes=genes):
+                if event.get("type") in ("progress", "result", "error"):
+                    yield sse(event)
             yield sse({"type": "done"})
         except Exception as exc:
             logger.exception("[/api/experiment/run] failed")
+            yield sse({"type": "error", "data": str(exc)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+@router.post("/api/gene-transfer/preview")
+async def gene_transfer_preview(
+    request: Request,
+    user=Depends(get_current_user),
+    services: WebServices = Depends(get_services),
+):
+    """预览转基因实验方案：从对话文本提取基因（NCBI 验证）并推断受体物种。
+
+    返回:
+        JSONResponse: 包含 genes（验证后的基因列表）和 species（受体物种名列表）的 JSON。
+    """
+    data = await request.json()
+    goal = (data.get("goal") or data.get("query") or data.get("answer_text") or "").strip()
+    selected_gene_names = data.get("selected_gene_names") or data.get("user_genes") or None
+    if not goal:
+        raise HTTPException(status_code=400, detail="缺少 goal")
+    try:
+        result = await services.gene_transfer_service.preview_species(
+            goal=goal,
+            selected_gene_names=selected_gene_names,
+        )
+    except Exception as exc:
+        logger.exception("[/api/gene-transfer/preview] failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return JSONResponse(result)
+
+
+@router.post("/api/gene-transfer/run")
+async def gene_transfer_run(
+    request: Request,
+    user=Depends(get_current_user),
+    services: WebServices = Depends(get_services),
+):
+    """执行转基因实验方案生成 Pipeline，通过 SSE 流式返回结果。
+
+    请求体字段:
+        genes: 已验证的基因信息字典列表。
+        species_list: 受体物种拉丁名列表。
+
+    SSE 事件类型:
+        progress / result / done / error
+    """
+    data = await request.json()
+    genes = data.get("genes")
+    species_list = data.get("species_list")
+    if not genes:
+        raise HTTPException(status_code=400, detail="缺少 genes 列表")
+    if not species_list:
+        raise HTTPException(status_code=400, detail="缺少 species_list 列表")
+
+    async def generate():
+        try:
+            yield sse({"type": "progress", "step": 1, "total": 2, "msg": "正在从 NCBI 获取基因序列及上下游区域..."})
+            sops = await services.gene_transfer_service.run(genes=genes, species_list=species_list)
+            yield sse({"type": "progress", "step": 2, "total": 2, "msg": "正在填充转基因实验方案模板..."})
+            yield sse({"type": "result", "sops": sops})
+            yield sse({"type": "done"})
+        except Exception as exc:
+            logger.exception("[/api/gene-transfer/run] failed")
             yield sse({"type": "error", "data": str(exc)})
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers=SSE_HEADERS)

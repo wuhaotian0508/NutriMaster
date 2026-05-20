@@ -128,10 +128,15 @@ const I18N = {
         'history.oldRecord': '（旧记录，无回答内容）',
         'confirm.clearHistory': '确定要清空所有历史记录吗？',
         // 基因编辑器
-        'gene.detected': '检测到以下可编辑基因：',
+        'gene.detected': '检测到以下可操作基因：',
         'gene.addBtn': '+ 添加基因',
         'gene.inputPlaceholder': '输入基因名',
         'gene.removeTitle': '移除此基因',
+        // 物种编辑器（转基因）
+        'species.detected': '检测到以下可转基因物种：',
+        'species.addBtn': '+ 添加物种',
+        'species.inputPlaceholder': '输入物种拉丁名',
+        'species.removeTitle': '移除此物种',
         // 欢迎标语
         'slogans': [
             "今天你想知道点什么？",
@@ -269,10 +274,15 @@ const I18N = {
         'history.oldRecord': '(Old record, no answer)',
         'confirm.clearHistory': 'Clear all history?',
         // Gene editor
-        'gene.detected': 'Detected editable genes:',
+        'gene.detected': 'Detected actionable genes:',
         'gene.addBtn': '+ Add gene',
         'gene.inputPlaceholder': 'Gene name',
         'gene.removeTitle': 'Remove this gene',
+        // Species editor (transgenic)
+        'species.detected': 'Detected transgenic target species:',
+        'species.addBtn': '+ Add species',
+        'species.inputPlaceholder': 'Species Latin name',
+        'species.removeTitle': 'Remove this species',
         'slogans': [
             "What would you like to discover today?",
             "Unlock the secrets of plant metabolism.",
@@ -788,6 +798,9 @@ async function handleSend() {
         experimentDone: false,
         genesAvailable: false,
         genes: [],  // 检测到的基因名列表（由后端 genes_available 事件填充）
+        species: [],  // 转基因受体物种列表（preview 时由 LLM 推断）
+        geneTransferRunning: false,
+        geneTransferDone: false,
         streamDone: false, // 标记流式传输是否完成，防止后续 updateMessage 覆盖按钮
         interactionId: '',
         turnId: '',
@@ -938,6 +951,10 @@ async function streamQuery(query, messageId) {
                         sources = data.data;
                         const state = getAssistantTurnState(messageId);
                         state.sources = sources;
+                    } else if (data.type === 'answer_renumbered') {
+                        answerText = data.data;
+                        const state = getAssistantTurnState(messageId);
+                        state.answerText = answerText;
                     } else if (data.type === 'text') {
                         // 收到正式回答后，结束思考状态
                         finalizeThinkingUI(messageId);
@@ -971,6 +988,12 @@ async function streamQuery(query, messageId) {
                         if (data.genes && Array.isArray(data.genes)) {
                             state.genes = data.genes;
                         }
+                    } else if (data.type === 'species_available') {
+                        // 后端 LLM 推断出受体物种，提前填入 state
+                        const state = getAssistantTurnState(messageId);
+                        if (data.species && Array.isArray(data.species) && state.species.length === 0) {
+                            state.species = [...data.species];
+                        }
                     } else if (data.type === 'done') {
                         const state = getAssistantTurnState(messageId);
                         state.streamDone = true;
@@ -983,6 +1006,7 @@ async function streamQuery(query, messageId) {
                             extrasEl.insertAdjacentHTML('beforeend', renderReferences(sources, messageId));
                         }
                         renderExperimentButton(messageId);
+                        prefetchTransgenicSpecies(messageId);
                         renderFeedbackControls(messageId);
                     } else if (data.type === 'error') {
                         const state = getAssistantTurnState(messageId);
@@ -1018,6 +1042,7 @@ async function streamQuery(query, messageId) {
                             extrasEl.insertAdjacentHTML('beforeend', renderReferences(sources, messageId));
                         }
                         renderExperimentButton(messageId);
+                        prefetchTransgenicSpecies(messageId);
                         renderFeedbackControls(messageId);
                     }
                 } catch (parseErr) {
@@ -1131,6 +1156,126 @@ async function streamExperiment(messageId) {
                     updateLastTurnSops(state.sops, state.genes);
                 } else if (data.type === 'error') {
                     state.experimentRunning = false;
+                    handleExperimentError(messageId, data.msg || data.data || t('auth.networkFail'));
+                    renderExperimentButton(messageId);
+                }
+            } catch (e) {
+                if (e.message && !e.message.startsWith('Unexpected')) throw e;
+            }
+        }
+        if (done) break;
+    }
+}
+
+/**
+ * 执行转基因实验方案生成流程（Phase A+B: preview, Phase C: run）
+ * @param {string} messageId - 消息 DOM 元素 ID
+ */
+async function streamGeneTransfer(messageId) {
+    const state = getAssistantTurnState(messageId);
+
+    // ---- Phase A+B: 提取基因/物种 + NCBI 验证 ----
+    const extractResp = await fetch('/api/gene-transfer/preview', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + getAccessToken(),
+        },
+        body: JSON.stringify({
+            goal: `${state.query || ''}\n${state.answerText || ''}`.trim(),
+            selected_gene_names: state.genes || [],
+        }),
+    });
+
+    if (extractResp.status === 401) { showLoginOverlay(); throw new Error(t('auth.expired')); }
+    if (!extractResp.ok) {
+        const err = await extractResp.json().catch(() => ({}));
+        throw new Error(err.detail || t('auth.networkFail'));
+    }
+
+    const { extrasEl } = getMessageRegions(messageId);
+    removeExperimentButton(messageId);
+
+    const progressEl = document.createElement('div');
+    progressEl.className = 'sop-extract-progress';
+    progressEl.innerHTML = `<div class="search-progress"><span class="search-spinner"></span>${t('sop.extracting')}</div>`;
+    if (extrasEl) extrasEl.appendChild(progressEl);
+
+    const preview = await extractResp.json();
+    progressEl.remove();
+
+    const verifiedGenes = preview.genes || [];
+    const llmSpecies = preview.species || [];
+
+    // 用 LLM 推断的物种覆盖 state.species（如果用户尚未手动编辑）
+    if (llmSpecies.length > 0 && state.species.length === 0) {
+        state.species = [...llmSpecies];
+    }
+
+    if (!verifiedGenes || verifiedGenes.length === 0) {
+        renderExperimentButton(messageId);
+        return;
+    }
+
+    // ---- 展示 NCBI 验证结果，等待用户确认 ----
+    const confirmed = await showNCBIVerification(messageId, verifiedGenes, extrasEl);
+    if (!confirmed) {
+        renderExperimentButton(messageId);
+        return;
+    }
+
+    // ---- 物种确认：使用 state.species（已含 LLM 推断结果，用户可修改） ----
+    const speciesList = state.species.filter(s => s.trim());
+    if (speciesList.length === 0) {
+        handleExperimentError(messageId, '未检测到转基因受体物种，请在列表中手动添加物种（拉丁名）后再试。');
+        renderExperimentButton(messageId);
+        return;
+    }
+
+    // ---- Phase C: 执行转基因 SOP pipeline ----
+    state.geneTransferRunning = true;
+    state.geneTransferDone = false;
+    appendExperimentProgress(messageId, confirmed.map(g => g.gene), '🌱 转基因实验方案生成', STEP_LABELS_GT);
+
+    const runResp = await fetch('/api/gene-transfer/run', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + getAccessToken(),
+        },
+        body: JSON.stringify({ genes: confirmed, species_list: speciesList }),
+    });
+
+    if (!runResp.ok) {
+        const err = await runResp.json().catch(() => ({}));
+        throw new Error(err.detail || t('auth.networkFail'));
+    }
+
+    const reader = runResp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+        const lines = buffer.split('\n');
+        buffer = done ? '' : (lines.pop() || '');
+
+        for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+                const data = JSON.parse(line.slice(6));
+                if (data.type === 'progress') {
+                    updateExperimentProgress(messageId, data);
+                } else if (data.type === 'result' && data.sops) {
+                    state.geneTransferDone = true;
+                    state.geneTransferRunning = false;
+                    state.sops = { ...(state.sops || {}), ...data.sops };
+                    const regions = getMessageRegions(messageId);
+                    if (regions.extrasEl) renderSOPs(regions.extrasEl, data.sops, 'gene_transfer');
+                    updateLastTurnSops(state.sops, state.genes);
+                } else if (data.type === 'error') {
+                    state.geneTransferRunning = false;
                     handleExperimentError(messageId, data.msg || data.data || t('auth.networkFail'));
                     renderExperimentButton(messageId);
                 }
@@ -1410,6 +1555,9 @@ function getAssistantTurnState(messageId) {
             experimentDone: false,
             genesAvailable: false,
             genes: [],
+            species: [],
+            geneTransferRunning: false,
+            geneTransferDone: false,
             streamDone: false,
             interactionId: '',
             turnId: '',
@@ -1658,97 +1806,121 @@ function renderExperimentButton(messageId) {
 
     // ---- 渲染基因编辑器（可编辑的基因芯片列表） ----
     if (state.genes && state.genes.length > 0) {
-        const geneEditor = renderGeneEditor(messageId, state);
+        const geneEditor = renderChipEditor(messageId, state, 'genes', 'gene');
         container.appendChild(geneEditor);
     }
 
-    // ---- 创建 SOP 生成按钮 ----
+    // ---- 渲染物种编辑器（可编辑的物种芯片列表，转基因用） ----
+    const speciesEditor = renderChipEditor(messageId, state, 'species', 'species');
+    container.appendChild(speciesEditor);
+
+    // ---- 基因编辑 SOP 按钮行 ----
+    const btnRow1 = document.createElement('div');
+    btnRow1.className = 'experiment-btn-row';
     const btn = document.createElement('button');
     btn.className = 'experiment-btn';
     btn.type = 'button';
-    btn.textContent = '🧬 生成 CRISPR 实验方案 SOP';
+    btn.textContent = '🧬 生成基因编辑实验方案 SOP';
     btn.addEventListener('click', async () => {
         btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = '验证中 ';
+        const spinner = document.createElement('span');
+        spinner.className = 'search-spinner btn-inline-spinner';
+        btn.appendChild(spinner);
         try {
             await streamExperiment(messageId);
         } catch (error) {
             btn.disabled = false;
+            btn.textContent = originalText;
             handleExperimentError(messageId, error.message);
         }
     });
-    container.appendChild(btn);
+    btnRow1.appendChild(btn);
+    container.appendChild(btnRow1);
+
+    // ---- 转基因 SOP 按钮行（单独一行，与上方有间距） ----
+    const btnRow2 = document.createElement('div');
+    btnRow2.className = 'experiment-btn-row experiment-btn-row--secondary';
+    const gtBtn = document.createElement('button');
+    gtBtn.className = 'experiment-btn gene-transfer-btn';
+    gtBtn.type = 'button';
+    gtBtn.textContent = '🌱 生成转基因实验方案 SOP';
+    gtBtn.addEventListener('click', async () => {
+        gtBtn.disabled = true;
+        const originalText = gtBtn.textContent;
+        gtBtn.textContent = '验证中 ';
+        const spinner = document.createElement('span');
+        spinner.className = 'search-spinner btn-inline-spinner';
+        gtBtn.appendChild(spinner);
+        try {
+            await streamGeneTransfer(messageId);
+        } catch (error) {
+            gtBtn.disabled = false;
+            gtBtn.textContent = originalText;
+            handleExperimentError(messageId, error.message);
+        }
+    });
+    btnRow2.appendChild(gtBtn);
+    container.appendChild(btnRow2);
 
     // 始终放到 extrasEl（不插入 answerEl，避免被 updateMessage 覆盖）
     extrasEl.appendChild(container);
 }
 
 /**
- * 渲染基因编辑器 —— 可编辑的基因芯片（chip）列表
- *
- * 功能：
- * - 展示后端检测到的基因名，每个基因显示为一个可删除的芯片
- * - 用户可以点击 "×" 移除不需要的基因
- * - 用户可以通过 "+" 按钮添加新的基因名
- * - 编辑结果实时同步到 state.genes，点击 SOP 按钮时传给后端
+ * 渲染通用芯片编辑器 —— 可编辑的芯片（chip）列表
  *
  * @param {string} messageId - 消息 DOM 元素 ID
  * @param {object} state - assistantTurnState 中的状态对象
- * @returns {HTMLElement} 基因编辑器 DOM 元素
+ * @param {string} stateKey - state 中存储列表的键名（'genes' 或 'species'）
+ * @param {string} i18nPrefix - i18n 键前缀（'gene' 或 'species'）
+ * @returns {HTMLElement} 编辑器 DOM 元素
  */
-function renderGeneEditor(messageId, state) {
+function renderChipEditor(messageId, state, stateKey, i18nPrefix) {
     const editor = document.createElement('div');
     editor.className = 'gene-editor';
 
-    // ---- 标题标签 ----
     const label = document.createElement('div');
     label.className = 'gene-editor-label';
-    label.textContent = t('gene.detected');
+    label.textContent = t(`${i18nPrefix}.detected`);
     editor.appendChild(label);
 
-    // ---- 芯片容器（放置所有基因芯片 + 添加按钮） ----
     const chipsContainer = document.createElement('div');
     chipsContainer.className = 'gene-chips-container';
+    chipsContainer.dataset.statekey = stateKey;
 
-    /**
-     * 重新渲染所有基因芯片（在添加/删除操作后调用）
-     */
     function rebuildChips() {
         chipsContainer.innerHTML = '';
+        const list = state[stateKey] || [];
 
-        // 为每个基因创建一个可删除的芯片
-        state.genes.forEach((geneName, index) => {
+        list.forEach((itemName, index) => {
             const chip = document.createElement('span');
             chip.className = 'gene-chip';
 
-            // 基因名文本
             const nameSpan = document.createElement('span');
             nameSpan.className = 'gene-chip-name';
-            nameSpan.textContent = geneName;
+            nameSpan.textContent = itemName;
             chip.appendChild(nameSpan);
 
-            // "×" 删除按钮
             const removeBtn = document.createElement('button');
             removeBtn.className = 'gene-chip-remove';
             removeBtn.type = 'button';
-            removeBtn.textContent = '\u00d7';  // × 符号
-            removeBtn.title = t('gene.removeTitle');
+            removeBtn.textContent = '×';
+            removeBtn.title = t(`${i18nPrefix}.removeTitle`);
             removeBtn.addEventListener('click', () => {
-                // 从 state.genes 中移除该基因并重新渲染
-                state.genes.splice(index, 1);
+                state[stateKey].splice(index, 1);
                 rebuildChips();
             });
             chip.appendChild(removeBtn);
-
             chipsContainer.appendChild(chip);
         });
 
-        // ---- "+" 添加基因按钮 ----
         const addBtn = document.createElement('button');
         addBtn.className = 'gene-add-btn';
         addBtn.type = 'button';
-        addBtn.textContent = t('gene.addBtn');
+        addBtn.textContent = t(`${i18nPrefix}.addBtn`);
         addBtn.addEventListener('click', () => {
-            // 替换"+"按钮为输入框
             addBtn.style.display = 'none';
 
             const inputWrapper = document.createElement('span');
@@ -1757,47 +1929,32 @@ function renderGeneEditor(messageId, state) {
             const input = document.createElement('input');
             input.className = 'gene-add-input';
             input.type = 'text';
-            input.placeholder = t('gene.inputPlaceholder');
-            input.maxLength = 30;
+            input.placeholder = t(`${i18nPrefix}.inputPlaceholder`);
+            input.maxLength = 60;
 
-            /**
-             * 确认添加基因：去重后加入列表
-             */
             function confirmAdd() {
                 const name = input.value.trim();
-                if (name && !state.genes.includes(name)) {
-                    state.genes.push(name);
+                if (name && !state[stateKey].includes(name)) {
+                    state[stateKey].push(name);
                 }
-                // 无论是否添加成功，都重新渲染（移除输入框）
                 rebuildChips();
             }
 
-            // 按 Enter 确认添加
             input.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
-                    e.preventDefault();
-                    confirmAdd();
-                } else if (e.key === 'Escape') {
-                    // 按 Escape 取消输入
-                    rebuildChips();
-                }
+                if (e.key === 'Enter') { e.preventDefault(); confirmAdd(); }
+                else if (e.key === 'Escape') { rebuildChips(); }
             });
-
-            // 失焦时确认添加
             input.addEventListener('blur', confirmAdd);
 
             inputWrapper.appendChild(input);
             chipsContainer.appendChild(inputWrapper);
-
-            // 自动聚焦输入框
             input.focus();
         });
         chipsContainer.appendChild(addBtn);
     }
 
-    // 首次渲染芯片
     rebuildChips();
-
+    chipsContainer._rebuild = rebuildChips;
     editor.appendChild(chipsContainer);
     return editor;
 }
@@ -1807,6 +1964,35 @@ function removeExperimentButton(messageId) {
     const { extrasEl } = getMessageRegions(messageId);
     extrasEl?.querySelector('.experiment-trigger-area')?.remove();
     extrasEl?.querySelector('.experiment-btn')?.remove();
+}
+
+async function prefetchTransgenicSpecies(messageId) {
+    const state = getAssistantTurnState(messageId);
+    if (!state || state.species.length > 0) return;
+    const goal = `${state.query || ''}\n${state.answerText || ''}`.trim();
+    if (!goal) return;
+    try {
+        const resp = await fetch('/api/gene-transfer/preview', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + getAccessToken(),
+            },
+            body: JSON.stringify({ goal, selected_gene_names: state.genes || [] }),
+        });
+        if (!resp.ok) return;
+        const preview = await resp.json();
+        const llmSpecies = preview.species || [];
+        if (llmSpecies.length > 0 && state.species.length === 0) {
+            state.species = [...llmSpecies];
+            // 刷新已渲染的物种芯片编辑器
+            const { extrasEl } = getMessageRegions(messageId);
+            const container = extrasEl?.querySelector('[data-statekey="species"]');
+            if (container?._rebuild) container._rebuild();
+        }
+    } catch (_) {
+        // 后台预取失败静默忽略
+    }
 }
 
 // HTML 转义
@@ -2062,6 +2248,7 @@ function restoreConversation(session) {
         if (turn.genes && turn.genes.length > 0 && (!turn.sops || Object.keys(turn.sops).length === 0)) {
             state.genesAvailable = true;
             renderExperimentButton(msgId);
+            prefetchTransgenicSpecies(msgId);
         }
     }
 
@@ -2080,26 +2267,36 @@ function clearHistory() {
 
 // ===== CRISPR 实验方案自动生成（内联 pipeline 进度） =====
 
-const STEP_LABELS = [
-    '查询 NCBI Accession',
+const STEP_LABELS_CRISPR = [
+    '获取基因登录号',
     '下载基因序列',
     '设计 CRISPR 靶点',
     '生成实验方案 SOP',
 ];
 
-function appendExperimentProgress(messageId, genes) {
+const STEP_LABELS_GT = [
+    '从 NCBI 获取基因及上下游序列',
+    '填充转基因实验方案模板',
+];
+
+// 兼容旧引用
+const STEP_LABELS = STEP_LABELS_CRISPR;
+
+function appendExperimentProgress(messageId, genes, title, stepLabels) {
     const { extrasEl } = getMessageRegions(messageId);
     if (!extrasEl) return;
 
     extrasEl.querySelectorAll('.experiment-progress, .experiment-sop').forEach(el => el.remove());
 
     const genesStr = genes ? genes.join(', ') : '';
+    const labels = stepLabels || STEP_LABELS_CRISPR;
 
     const progressEl = document.createElement('div');
     progressEl.className = 'experiment-progress';
     progressEl.id = `exp-progress-${messageId}`;
-    progressEl.innerHTML = `<div class="experiment-progress-title">\uD83D\uDD2C CRISPR 实验方案生成${genesStr ? '（' + escapeHtml(genesStr) + '）' : ''}</div>` +
-        STEP_LABELS.map((label, i) =>
+    progressEl.setAttribute('data-step-count', labels.length);
+    progressEl.innerHTML = `<div class="experiment-progress-title">${escapeHtml(title || '🔬 CRISPR 实验方案生成')}${genesStr ? '（' + escapeHtml(genesStr) + '）' : ''}</div>` +
+        labels.map((label, i) =>
             `<div class="experiment-step" id="exp-step-${messageId}-${i+1}">` +
             `<span class="step-icon">${i+1}</span>` +
             `<span class="step-label">${label}</span>` +
@@ -2111,20 +2308,30 @@ function appendExperimentProgress(messageId, genes) {
 
 function updateExperimentProgress(messageId, data) {
     const step = data.step;
-    // 标记之前的步骤为 done
-    for (let i = 1; i < step; i++) {
-        const el = document.getElementById(`exp-step-${messageId}-${i}`);
-        if (el && !el.classList.contains('done')) {
+    const isDone = data.done === true;
+
+    if (isDone) {
+        // 当前步骤完成：标绿
+        const el = document.getElementById(`exp-step-${messageId}-${step}`);
+        if (el) {
             el.classList.remove('active');
             el.classList.add('done');
             el.querySelector('.step-icon').textContent = '\u2713';
         }
-    }
-    // 标记当前步骤为 active
-    const curEl = document.getElementById(`exp-step-${messageId}-${step}`);
-    if (curEl) {
-        curEl.classList.add('active');
-        curEl.querySelector('.step-label').textContent = data.msg;
+    } else {
+        // 步骤开始：把之前所有步骤标绿（防止跳步），当前步骤标为 active
+        for (let i = 1; i < step; i++) {
+            const el = document.getElementById(`exp-step-${messageId}-${i}`);
+            if (el && !el.classList.contains('done')) {
+                el.classList.remove('active');
+                el.classList.add('done');
+                el.querySelector('.step-icon').textContent = '\u2713';
+            }
+        }
+        const curEl = document.getElementById(`exp-step-${messageId}-${step}`);
+        if (curEl) {
+            curEl.classList.add('active');
+        }
     }
     smartScroll();
 }
@@ -2134,9 +2341,12 @@ function handleExperimentError(messageId, msg) {
         appendExperimentProgress(messageId, []);
     }
 
+    // 动态读取当前进度条的步骤数（兼容 CRISPR 4步和转基因 2步）
+    const progressEl = document.getElementById(`exp-progress-${messageId}`);
+    const stepCount = progressEl ? parseInt(progressEl.getAttribute('data-step-count') || '4', 10) : 4;
+
     let targetEl = null;
-    // 找到最后一个 active 步骤并标记为 error
-    for (let i = STEP_LABELS.length; i >= 1; i--) {
+    for (let i = stepCount; i >= 1; i--) {
         const el = document.getElementById(`exp-step-${messageId}-${i}`);
         if (el && el.classList.contains('active')) {
             targetEl = el;
@@ -2155,7 +2365,8 @@ function handleExperimentError(messageId, msg) {
     smartScroll();
 }
 
-function renderSOPs(container, sops) {
+
+function renderSOPs(container, sops, sopType) {
     container.querySelectorAll('.experiment-sop').forEach(el => el.remove());
     // 标记所有进度步骤为 done
     const progressEl = container.closest('.message-content')?.querySelector('.experiment-progress') || container.querySelector('.experiment-progress');
@@ -2163,9 +2374,13 @@ function renderSOPs(container, sops) {
         progressEl.querySelectorAll('.experiment-step').forEach(el => {
             el.classList.remove('active');
             el.classList.add('done');
-            el.querySelector('.step-icon').textContent = '\u2713';
+            el.querySelector('.step-icon').textContent = '✓';
         });
     }
+
+    // sopType: 'crispr' | 'gene_transfer' | undefined(默认 crispr)
+    const isCrispr = sopType !== 'gene_transfer';
+    const typeLabel = isCrispr ? '🧬 CRISPR 实验方案' : '🌱 转基因实验方案';
 
     for (const [accession, text] of Object.entries(sops)) {
         const sopEl = document.createElement('div');
@@ -2174,26 +2389,23 @@ function renderSOPs(container, sops) {
         const headerEl = document.createElement('div');
         headerEl.className = 'experiment-sop-header';
 
-        // 生成下载文件名：基因名（accession）+ 登录账号
         let userEmail = 'user';
         try {
             if (typeof currentSession !== 'undefined' && currentSession && currentSession.user && currentSession.user.email) {
                 userEmail = currentSession.user.email.split('@')[0];
             }
-        } catch (e) {
-            // 忽略错误，使用默认值
-        }
+        } catch (e) {}
         const safeAccession = accession.replace(/[^a-zA-Z0-9\-_]/g, '_');
-        const downloadFilename = `${safeAccession}_${userEmail}.doc`;
+        const typePrefix = isCrispr ? 'CRISPR' : 'GeneTransfer';
+        const downloadFilename = `${typePrefix}_${safeAccession}_${userEmail}.doc`;
 
         headerEl.innerHTML =
-            `<span class="experiment-sop-title">\uD83D\uDCCB 实验方案: ${escapeHtml(accession)}</span>` +
+            `<span class="experiment-sop-title">${escapeHtml(typeLabel)}: ${escapeHtml(accession)}</span>` +
             `<span style="display:flex;align-items:center;gap:8px;">` +
             `<button class="sop-download-btn" title="下载实验方案">⬇ 下载</button>` +
-            `<span class="experiment-sop-toggle">\u25BC</span>` +
+            `<span class="experiment-sop-toggle">▼</span>` +
             `</span>`;
 
-        // 用 addEventListener 绑定下载，避免将大量 SOP 文本嵌入 onclick 属性导致 HTML 解析错误
         headerEl.querySelector('.sop-download-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             downloadSOP(downloadFilename, text);

@@ -92,56 +92,76 @@ def _fetch_fasta_text(accession: str, params: dict) -> str:
     raise ValueError(f"未能下载 accession {accession} 的序列")
 
 
-def run_accession2sequence(accession_file: Path, work_dir: Path) -> Path:
-    """读取 accession 列表文件，从 NCBI 下载对应的 FASTA 序列并保存到工作目录。
-
-    accession 文件格式为 TSV，每行至少三列，第三列为 accession 编号。
-    下载的序列将合并写入 work_dir/sequence.fas 文件中，每条序列的 header 统一替换为 accession 编号。
-
-    Args:
-        accession_file: accession 列表文件路径，TSV 格式（基因名\\t物种\\taccession）。
-        work_dir: 工作目录，FASTA 输出文件将写入此目录。
-
-    Returns:
-        Path: 生成的 FASTA 文件路径（work_dir/sequence.fas）。
-
-    Raises:
-        ValueError: 没有有效的 accession 可下载，或所有下载均失败导致输出文件为空。
-    """
-    fasta_file = work_dir / "sequence.fas"
-    accessions = []
+def _read_accession_file(accession_file: Path) -> list[tuple[str, str, str]]:
+    """读取单个 accession 文件，返回 (gene, species, accession) 三元组列表。"""
+    rows = []
     with accession_file.open(encoding="utf-8") as file:
         for line in file:
             parts = line.strip().split("\t")
             if len(parts) >= 3 and parts[2]:
-                accessions.append(parts[2])
-    if not accessions:
+                rows.append((parts[0], parts[1], parts[2]))
+    return rows
+
+
+def run_accession2sequence(accession_files: list[Path], work_dir: Path) -> list[Path]:
+    """读取各物种 accession 文件，从 NCBI 下载对应的 FASTA 序列，按物种分别保存。
+
+    每个输入文件对应一个物种，TSV 格式（基因名\\t物种\\taccession）。
+    每个物种的序列写入 work_dir/{species}_sequence.fas，序列 header 为 >{species} {accession}。
+
+    Args:
+        accession_files: gene2accession 生成的各物种 accession 文件路径列表。
+        work_dir: 工作目录，FASTA 输出文件将写入此目录。
+
+    Returns:
+        list[Path]: 生成的各物种 FASTA 文件路径列表。
+
+    Raises:
+        ValueError: 所有文件中均无有效 accession，或所有下载均失败时抛出。
+    """
+    species_rows: dict[str, list[tuple[str, str, str]]] = {}
+    for accession_file in accession_files:
+        for gene, species, accession in _read_accession_file(accession_file):
+            species_rows.setdefault(species, []).append((gene, species, accession))
+
+    if not species_rows:
         raise ValueError("没有有效的 accession 可供下载序列")
-    with fasta_file.open("w", encoding="utf-8") as output:
-        for accession in accessions:
-            params = {
-                "db": "nuccore",
-                "id": accession,
-                "rettype": "fasta",
-                "retmode": "text",
-                "email": _ENTREZ_EMAIL,
-                "tool": "nutrimaster_rag",
-            }
-            try:
-                text = _fetch_fasta_text(accession, params)
-            except requests.exceptions.RequestException as exc:
-                logger.warning("accession %s download failed, skipping: %s", accession, exc)
-                continue
-            if not text.startswith(">"):
-                logger.warning("accession %s returned non-FASTA content, skipping", accession)
-                continue
-            lines = text.splitlines()
-            lines[0] = f">{accession}"
-            output.write("\n".join(lines) + "\n")
-            time.sleep(0.34)
-    if fasta_file.stat().st_size == 0:
+
+    output_files = []
+    for species, rows in species_rows.items():
+        filename = species.replace(" ", "_") + "_sequence.fas"
+        fasta_file = work_dir / filename
+        with fasta_file.open("w", encoding="utf-8") as output:
+            for gene, sp, accession in rows:
+                params = {
+                    "db": "nuccore",
+                    "id": accession,
+                    "rettype": "fasta",
+                    "retmode": "text",
+                    "email": _ENTREZ_EMAIL,
+                    "tool": "nutrimaster_rag",
+                }
+                try:
+                    text = _fetch_fasta_text(accession, params)
+                except requests.exceptions.RequestException as exc:
+                    logger.warning("accession %s download failed, skipping: %s", accession, exc)
+                    continue
+                if not text.startswith(">"):
+                    logger.warning("accession %s returned non-FASTA content, skipping", accession)
+                    continue
+                lines = text.splitlines()
+                lines[0] = f">{sp.replace(' ', '_')}_{gene}_{accession}"
+                output.write("\n".join(lines) + "\n")
+                time.sleep(0.34)
+        if fasta_file.stat().st_size == 0:
+            logger.warning("物种 %s 未能下载到任何基因序列，跳过", species)
+            fasta_file.unlink()
+            continue
+        output_files.append(fasta_file)
+
+    if not output_files:
         raise ValueError("未能下载到任何基因序列")
-    return fasta_file
+    return output_files
 
 
 __all__ = ["run_accession2sequence"]

@@ -1,11 +1,17 @@
-# Environment variables
+# ── Environment ──────────────────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
 .eval_env
 
-# Python
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -13,115 +19,79 @@ __pycache__/
 dist/
 build/
 *.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Jupyter Notebook
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+*.ipynb
 .ipynb_checkpoints/
 
-# Virtual environments
-venv/
-env/
-.venv/
-
-# IDE
+# ── IDE / editor ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
-.claude/
-.codex/
 
-# OS files
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Node.js / Next.js (web/)
-node_modules/
-web/.next/
-web/out/
-web/.env.local
-
-# Static build output
-/public/
-
-# OpenCode
+# ── AI assistant workspaces ───────────────────────────────────────────────────
+.claude/
+.codex/
 opencode.json
 
-# Others
-/self-learn/
-/test/
-/docs/
-/nutri_fields_v2.xlsx
-*.png
-/examples/
-*.csv
-*.tar
-*.tar.gz
-*.zip
-*.xlsx
-/old_scripts/
-/package-lock.json
-/nutri_fields_v2.xlsx
-/项目文件.md
-/.codex
-/.claude
-# Backup directories
-data/backup_*/
-
-
-/claude-changes
-/ragtry
-*.ipynb
-
-# Logs and caches
+# ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
-.pytest_cache/
+logs/
 
-# Python caches
-**/__pycache__/
+# ── Runtime / generated data (primary assets excluded below) ─────────────────
+# Extraction pipeline
+src/nutrimaster/extraction/input/processed/
+src/nutrimaster/extraction/output/
+src/nutrimaster/extraction/reports/
 
-# Runtime / generated assets
-extractor/input/processed/
-extractor/output/
-extractor/reports/token-usage/
-data/corpus/*
-!data/corpus/.gitkeep
+# RAG index (regenerable)
 data/index/*
 !data/index/.gitkeep
+
+# Corpus: primary asset — protect with explicit tracking
+data/corpus/*
+!data/corpus/.gitkeep
+
+# User runtime data
 data/personal_lib/
 data/user_skills/
 data/uploads/
 data/jobs/
 
-# Local workspace artifacts
+# Backup directories
+data/backup_*/
+data/index-backup-*/
+/data-backup/
+
+# ── Evaluation ───────────────────────────────────────────────────────────────
+.eval_checkpoints/
+
+# ── Local workspace scratch ───────────────────────────────────────────────────
 *.local
 *.tmp
-
-*.ipynb
-/no-use
-/artifacts
-/src/nutrimaster/extraction/reports/
-
-# 不要 add
-.plan.md
+*.tar
+*.tar.gz
 playground/
 workspaces/
+/artifacts/
+/ragtry/
+/no-use/
+/self-learn/
+/old_scripts/
+/others/
+/lib/
 
-/data-backup
-.eval_checkpoints/
-data/RAG_INDEX_REBUILD_20260510.md
-AGENTS.md
-CLAUDE.md
-DEPLOYMENT_*.md
-GIT_BRANCH_SUBMISSION_GUIDE.md
-INDEX_ROBUSTNESS.md
-admin_index_api_extension.py
-check_index_status.py
-process_zip_and_index.py
-quick_stats.py
-rebuild_index*.py
-test_*.py
-tests/unit/*.py
-lib/
-others/
-data/index-backup-before-full-rebuild-20260510000511/
-EVOMASTER_EVAL_GUIDE.md
+# ── Node.js (if applicable) ───────────────────────────────────────────────────
+node_modules/
+web/.next/
+web/out/
+web/.env.local
+/package-lock.json

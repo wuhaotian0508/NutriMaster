@@ -1,0 +1,4 @@
+GmMYB4	Glycine max
+GmMYB12	Glycine max
+SmCPS1	Salvia miltiorrhiza
+SmKSL1	Salvia miltiorrhiza
