@@ -41,13 +41,14 @@ class PromptBuilder:
 2. 涉及基因、蛋白、代谢通路、作物营养、文献证据的问题，优先调用 rag_search。
 3. rag_search 是复合 RAG 工具；只要调用它，内部会同时检索 PubMed 摘要和本地基因库。
 4. 调用 rag_search 时，由你负责生成检索词：query/gene_db_query 保留关键基因、通路、物种、代谢物；pubmed_query 必须是英文 PubMed 关键词或 Boolean 检索式。
-5. 用户明确要求实验设计、CRISPR、SOP、敲除/过表达实验方案时，调用 experiment_design。
+5. 用户明确要求 CRISPR 敲除/编辑实验方案时，调用 experiment_design（experiment_type="crispr"）；用户明确要求过表达或转基因实验方案时，调用 experiment_design（experiment_type="gene_transfer"）。experiment_design 需两步交互：先预览基因验证结果，用户确认后再设 confirmed=true 生成完整 SOP。
 6. 不要臆造引用。使用 rag_search 返回的证据时，正文必须使用证据中的 [编号]。
 
 回答要求：
-- 使用中文 Markdown。
-- 结论先行，必要时分点说明。
-- 对不确定的结论标明证据不足或需要进一步实验验证。
+- 使用中文 Markdown
+- 聚焦题目主旨回答，不随便发散；行文注意句子、段落间的逻辑结构关系，不滥用分点罗列
+- 根据使用到的语料回答科学问题本身并标注引文即可，不需要额外声明结论来自检索到的某篇或几篇文献
+- 对不确定的结论标明证据不足或需要进一步实验验证
 
 {self._skills_block(user_id)}
 """

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 
 from nutrimaster.agent.prompts import PromptBuilder
 from nutrimaster.experiment import extract_gene_names
+from nutrimaster.experiment.gene_validation import extract_transgenic_species_with_llm
 from nutrimaster.rag.evidence import CitationRegistry, EvidencePacket, evidence_key
 
 logger = logging.getLogger(__name__)
@@ -125,6 +127,34 @@ class Agent:
             if citation.get("tool_index") in cited_numbers
         ]
         return filtered or citations
+
+    @staticmethod
+    def _renumber_citations(answer_text: str, citations: list[dict]) -> tuple[str, list[dict]]:
+        """按正文首次出现顺序对文献重新从 1 连续编号，并同步更新正文中的引用角标。"""
+        known_indices = {c["tool_index"] for c in citations if c.get("tool_index")}
+        # 按正文出现顺序收集唯一引用编号
+        seen: list[int] = []
+        seen_set: set[int] = set()
+        for m in re.finditer(r"\[(\d+)\]", answer_text or ""):
+            n = int(m.group(1))
+            if n in known_indices and n not in seen_set:
+                seen.append(n)
+                seen_set.add(n)
+        if not seen:
+            return answer_text, citations
+        renumber_map = {old: new for new, old in enumerate(seen, start=1)}
+        citation_map = {c["tool_index"]: c for c in citations if c.get("tool_index")}
+        new_citations = [
+            {**citation_map[old], "tool_index": new,
+             "source_id": str(new)}
+            for old, new in renumber_map.items()
+        ]
+        new_text = re.sub(
+            r"\[(\d+)\]",
+            lambda m: f"[{renumber_map[int(m.group(1))]}]" if int(m.group(1)) in renumber_map else m.group(0),
+            answer_text,
+        )
+        return new_text, new_citations
 
     @staticmethod
     def _unique_citations(citations) -> list[dict]:
@@ -285,11 +315,20 @@ class Agent:
             answer_text=''.join(all_answer_parts)
             citations = self._filter_citations(answer_text, evidence_packets)
             if citations:
+                answer_text, citations = self._renumber_citations(answer_text, citations)
                 yield {"type": "citations", "data": citations}
+                yield {"type": "answer_renumbered", "data": answer_text}
                 yield {"type": "sources", "data": citations}
-            genes = extract_gene_names(answer_text or user_input)
+            full_text = answer_text or user_input
+            genes = extract_gene_names(full_text)
             if genes:
                 yield {"type": "genes_available", "genes": genes}
+                try:
+                    species = await asyncio.to_thread(extract_transgenic_species_with_llm, full_text)
+                    if species:
+                        yield {"type": "species_available", "species": species}
+                except Exception:
+                    pass
             yield {"type": "done"}
         except Exception as exc:
             logger.exception("Agent run failed")

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import queue
+import threading
+from typing import Any, AsyncGenerator
 
-from nutrimaster.experiment.crispr import run_crispr_workflow
-from nutrimaster.experiment.gene_validation import verify_genes_with_ncbi
+from nutrimaster.experiment.crispr import run_crispr_workflow, stream_crispr_workflow
+from nutrimaster.experiment.gene_validation import extract_transgenic_species_with_llm, verify_genes_with_ncbi
 from nutrimaster.experiment.sop import format_sops
 
 
@@ -64,22 +66,40 @@ class ExperimentDesignService:
         finally:
             pipeline.cleanup()
 
-    async def run(self, *, genes: list[dict[str, Any]]) -> dict[str, str]:
-        """运行完整的 CRISPR 实验设计工作流，生成 SOP。
+    async def run(self, *, genes: list[dict[str, Any]]) -> AsyncGenerator[dict, None]:
+        """流式运行完整的 CRISPR 实验设计工作流，逐步 yield progress/result/error 事件。
 
-        在后台线程中执行 CRISPR 工作流，处理完成后清理管线资源。
+        在后台线程中执行同步 pipeline，通过 queue 将事件传回主线程 async generator。
 
         Args:
-            genes: 基因信息字典列表，包含基因名称、物种等实验所需信息。
+            genes: 基因信息字典列表。
 
-        Returns:
-            dict[str, str]: 以登录号（accession）为键、SOP 文本为值的字典。
+        Yields:
+            dict: pipeline 产生的事件（type: progress / result / error）。
         """
         pipeline = self._create_pipeline()
-        try:
-            return await asyncio.to_thread(run_crispr_workflow, pipeline, genes)
-        finally:
-            pipeline.cleanup()
+        q: queue.Queue = queue.Queue()
+        _SENTINEL = object()
+
+        def _run_in_thread():
+            try:
+                for event in stream_crispr_workflow(pipeline, genes):
+                    q.put(event)
+            except Exception as exc:
+                q.put({"type": "error", "msg": str(exc)})
+            finally:
+                pipeline.cleanup()
+                q.put(_SENTINEL)
+
+        loop = asyncio.get_event_loop()
+        thread = threading.Thread(target=_run_in_thread, daemon=True)
+        thread.start()
+
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is _SENTINEL:
+                break
+            yield item
 
     async def tool_call(
         self,
@@ -112,7 +132,13 @@ class ExperimentDesignService:
             lines.append("")
             lines.append("如需完整 CRISPR/SOP，请明确要求生成完整实验方案。")
             return "\n".join(lines)
-        return format_sops(await self.run(genes=preview_genes))
+        sops: dict[str, str] = {}
+        async for event in self.run(genes=preview_genes):
+            if event.get("type") == "result":
+                sops = event.get("sops", {})
+            elif event.get("type") == "error":
+                raise RuntimeError(event.get("msg") or "实验流程失败")
+        return format_sops(sops)
 
     def _create_pipeline(self):
         """创建实验流程管线实例。
@@ -125,6 +151,80 @@ class ExperimentDesignService:
         """
         if self.pipeline_factory is not None:
             return self.pipeline_factory()
-        from nutrimaster.crispr.pipeline import ExperimentPipeline
+        from nutrimaster.experiment.crispr.pipeline import ExperimentPipeline
 
+        return ExperimentPipeline()
+
+
+class GeneTransferDesignService:
+    """转基因实验方案生成服务，供 Web API 调用。
+
+    协调从 LLM 推断受体物种、获取基因序列到 SOP 模板填充的完整流程。
+    """
+
+    async def preview_species(
+        self,
+        *,
+        goal: str,
+        selected_gene_names: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """使用 LLM 从对话文本推断转基因受体物种，并以 NCBI 验证基因信息。
+
+        Args:
+            goal: 包含对话上下文的目标描述文本。
+            selected_gene_names: 可选，用户已选定的基因名称列表（仅用于 NCBI 验证）。
+
+        Returns:
+            dict 包含：
+              - "genes": 验证后的基因列表
+              - "species": LLM 推断的受体物种拉丁名列表
+        """
+        pipeline = self._create_pipeline()
+        try:
+            if selected_gene_names:
+                genes = await asyncio.to_thread(
+                    pipeline.extract_selected_genes_with_llm,
+                    goal,
+                    selected_gene_names,
+                )
+            else:
+                genes = await asyncio.to_thread(pipeline.extract_genes_with_llm, goal)
+
+            verified = await asyncio.to_thread(verify_genes_with_ncbi, genes)
+            species = await asyncio.to_thread(extract_transgenic_species_with_llm, goal)
+            return {"genes": verified, "species": species}
+        finally:
+            pipeline.cleanup()
+
+    async def run(
+        self,
+        *,
+        genes: list[dict[str, Any]],
+        species_list: list[str],
+    ) -> dict[str, str]:
+        """执行完整的转基因实验方案生成流程。
+
+        Args:
+            genes: 经过 NCBI 验证的基因信息字典列表。
+            species_list: 受体物种拉丁名列表。
+
+        Returns:
+            dict[str, str]: 以物种名为键、Markdown SOP 文本为值的字典。
+        """
+        from nutrimaster.experiment.gene_transfer.gene2updown import run_gene_transfer_sequences
+        from nutrimaster.experiment.gene_transfer.experiment_design import run_gene_transfer_design
+
+        gene_results = await asyncio.to_thread(
+            run_gene_transfer_sequences,
+            genes,
+        )
+        sops = await asyncio.to_thread(
+            run_gene_transfer_design,
+            gene_results,
+            species_list,
+        )
+        return sops
+
+    def _create_pipeline(self):
+        from nutrimaster.experiment.crispr.pipeline import ExperimentPipeline
         return ExperimentPipeline()

@@ -30,12 +30,11 @@ ________________________________________
 Step 1：获取目的基因序列
 1.1 目标
 从NCBI获取目的基因的完整基因组序列（含内含子）和CDS序列，用于后续靶点设计和验证引物设计。
-所需信息
-•	NCBI GenBank登录号（_gene_accession_）
-
-1.	访问 https://www.ncbi.nlm.nih.gov/nuccore/_gene_accession_
-2.	下载FASTA格式序列（CDS区域）
-3.	记录外显子-内含子结构（Gene页面 → Genomic regions, transcripts, and products）
+• _gene_name_ NCBI GenBank登录号 _gene_accession_
+(1). 访问 https://www.ncbi.nlm.nih.gov/nuccore/_gene_accession_
+(2). 下载FASTA格式序列（CDS区域）
+_gene_sequence_
+(3). 记录外显子-内含子结构（Gene页面 → Genomic regions, transcripts, and products）
 
 参考资源
 数据库	网址	用途
@@ -70,13 +69,17 @@ o	参数：允许最多3个错配（含PAM）
 o	参考基因组：IRGSP-1.0（粳稻）或 Os-Nipponbare-Reference-IRGSP-1.0
 2.	排除在其他基因编码区有脱靶位点的sgRNA
 3.	最终选择 2-3个 sgRNA（建议选择靶向同一基因不同外显子的2个sgRNA）
+
+_crispr_target_candidate_
+
 （C）sgRNA序列确认
-•	sgRNA长度：20 nt（PAM）[_sequence_] （_PAM_）
-•	避免sgRNA序列以5'-TTTT-开头（U6启动子终止信号）
-•	避免GC含量 < 20% 或 > 80%
+• _gene_name_
+  sgRNA长度：20 nt（PAM）[_target_sequence_] （_PAM_）
+
 （D）合成oligo 每个sgRNA需合成一对互补oligo（用于Golden Gate克隆）：
-正向oligo: 5'-GCAG-[_sequence_]-3'
-反向oligo: 5'-AAAC-[_sequence_rt_]-3'
+• _gene_name_
+正向oligo: 5'-GCAG-[_target_sequence_]-3'
+反向oligo: 5'-AAAC-[_target_sequence_rc_]-3'
 注意： GCAG和AAAC为BsaI酶切后的粘性末端，与载体骨架匹配。具体粘性末端序列需根据所用载体确认。
 ________________________________________
 Step 3：CRISPR载体构建
@@ -328,7 +331,7 @@ T1代理论分离：
 •	农艺性状评估（株高、分蘖数、穗型、粒重等）
 6.5 株系命名与保存
 [基因名]-[sgRNA编号]-[T0株系号]-[T1株系号]
-例：_gene_name_-_target_number_-T0-3-T1-7
+• _gene_name_-_target_number_-T0-3-T1-7
 保存：
 1.	收取T1纯合编辑植株种子（T2代种子）
 2.	每株系保存至少50粒种子，-20°C干燥保存

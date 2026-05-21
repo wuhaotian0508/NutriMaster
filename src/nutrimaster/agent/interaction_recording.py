@@ -514,6 +514,8 @@ class InteractionRecordingSession:
             )
         elif event_type == "genes_available":
             self.record["final"]["genes"] = event.get("genes") or []
+        elif event_type == "species_available":
+            self.record["final"]["species"] = event.get("species") or []
         elif event_type == "error":
             self.record["final"]["error"] = str(event.get("data") or event.get("msg") or "")
 
