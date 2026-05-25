@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,22 @@ _DEEPSEEK_FORBIDDEN_PARAMS = {"logprobs", "top_logprobs"}
 _DEEPSEEK_DEFAULT_THINKING = {"type": "enabled"}
 _DEEPSEEK_DEFAULT_EFFORT = "high"
 _TIMEOUT = Timeout(timeout=300.0, connect=10.0)
+
+_GLOBAL_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def clear_global_proxy_env() -> None:
+    """Prevent non-Jina outbound clients from inheriting shell-level Clash proxy."""
+    for key in _GLOBAL_PROXY_ENV_KEYS:
+        os.environ.pop(key, None)
+
 
 
 def is_deepseek_reasoner(model_name: str) -> bool:
@@ -199,6 +216,7 @@ def create_llm_gateway(settings: Settings | None = None) -> LLMGateway:
         配置好的 LLMGateway 实例。
     """
     settings = settings or Settings.from_env()
+    clear_global_proxy_env()
     routes = {
         "primary": LLMRoute(
             client=AsyncOpenAI(
@@ -222,6 +240,7 @@ def create_sync_client(settings: Settings | None = None):
         配置好的同步 OpenAI 客户端实例。
     """
     settings = settings or Settings.from_env()
+    clear_global_proxy_env()
     return OpenAI(
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,

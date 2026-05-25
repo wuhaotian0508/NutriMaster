@@ -297,11 +297,15 @@ class Agent:
                         tool_content = result.to_tool_text()
                     else:
                         tool_content = str(result)
+                    tool_summary = tool_content[:500]
+                    tool_display = tool_summary
+                    if len(tool_content) > 500:
+                        tool_display += "\n...(full tool result is kept for model context; UI shows summary only)"
                     yield {
                         "type": "tool_result",
                         "tool": tool_name,
-                        "summary": tool_content[:500],
-                        "content": tool_content,
+                        "summary": tool_summary,
+                        "content": tool_display,
                     }
                     messages.append(
                         {
