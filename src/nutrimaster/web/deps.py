@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from dataclasses import dataclass, field
@@ -16,6 +17,13 @@ from nutrimaster.agent.tools import ExperimentDesignTool, RagSearchTool, ToolReg
 from nutrimaster.config.llm import call_llm
 from nutrimaster.config.settings import Settings
 from nutrimaster.experiment import ExperimentDesignService, GeneTransferDesignService
+from nutrimaster.rag.graph import (
+    GraphDbSource,
+    LocalGraphIndex,
+    Neo4jGraphConfig,
+    Neo4jGraphSource,
+    Neo4jGraphStore,
+)
 from nutrimaster.rag.jina import JinaRetriever
 from nutrimaster.rag.personal_library import PersonalLibrary
 from nutrimaster.rag.service import (
@@ -24,6 +32,8 @@ from nutrimaster.rag.service import (
     PubMedSource,
     RAGSearchService,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -92,6 +102,20 @@ class WebServices:
         self.retriever.build_index(**kwargs)
         if hasattr(self.retriever, "_bm25"):
             self.retriever._bm25 = None
+        if self.settings.rag is not None:
+            graph_data_dir = data_dir or self.settings.rag.data_dir
+            graph_backend = os.getenv("NUTRIMASTER_GRAPH_BACKEND", "sqlite").lower()
+            if graph_backend == "neo4j":
+                try:
+                    store = Neo4jGraphStore(Neo4jGraphConfig.from_env())
+                    try:
+                        store.build_from_corpus(graph_data_dir)
+                    finally:
+                        store.close()
+                except Exception as exc:
+                    logger.warning("Neo4j graph refresh failed: %s: %r", type(exc).__name__, exc)
+            elif graph_backend == "sqlite":
+                LocalGraphIndex(self.settings.rag.index_dir / "graph_index.sqlite").build_from_corpus(graph_data_dir)
 
 
 def create_services(settings: Settings | None = None) -> WebServices:
@@ -132,15 +156,17 @@ def create_services(settings: Settings | None = None) -> WebServices:
         """
         return holder["services"].get_personal_lib(user_id)
 
-    if build_index:
+    if build_index and hasattr(retriever, "build_index"):
         retriever.build_index()
 
     registry = ToolRegistry()
     experiment_service = ExperimentDesignService()
     gene_transfer_service = GeneTransferDesignService()
+    graph_source = _create_graph_source(settings)
     rag_service = RAGSearchService(
         pubmed_source=PubMedSource(),
         gene_db_source=GeneDbSource(retriever),
+        graph_source=graph_source,
         personal_source=PersonalLibrarySource(
             get_personal_lib=get_personal_lib,
             get_query_embedding=retriever.get_query_embedding,
@@ -162,6 +188,44 @@ def create_services(settings: Settings | None = None) -> WebServices:
     )
     holder["services"] = services
     return services
+
+
+def _create_graph_source(settings: Settings) -> Any | None:
+    """根据环境变量创建图 RAG 来源。
+
+    NUTRIMASTER_GRAPH_BACKEND:
+      - sqlite: 默认，使用 data/index/graph_index.sqlite；
+      - neo4j: 连接 Neo4j 并执行 Cypher 路径搜索；
+      - off: 关闭图 RAG。
+
+    Returns:
+        Graph source 实例；不可用时返回 None，不影响 PubMed/GeneDB。
+    """
+    if settings.rag is None:
+        return None
+
+    backend = os.getenv("NUTRIMASTER_GRAPH_BACKEND", "sqlite").lower()
+    build_graph = os.getenv("NUTRIMASTER_WEB_BUILD_GRAPH", "").lower() in {"1", "true", "yes", "on"}
+    if backend == "off":
+        return None
+
+    if backend == "neo4j":
+        try:
+            store = Neo4jGraphStore(Neo4jGraphConfig.from_env())
+            if build_graph:
+                store.build_from_corpus(settings.rag.data_dir)
+            if not store.is_available():
+                store.close()
+                return None
+            return Neo4jGraphSource(store)
+        except Exception as exc:
+            logger.warning("Neo4j graph source unavailable: %s: %r", type(exc).__name__, exc)
+            return None
+
+    graph_db_path = settings.rag.index_dir / "graph_index.sqlite"
+    if build_graph:
+        LocalGraphIndex(graph_db_path).build_from_corpus(settings.rag.data_dir)
+    return GraphDbSource(graph_db_path) if graph_db_path.exists() else None
 
 
 def get_services(request: Request) -> WebServices:

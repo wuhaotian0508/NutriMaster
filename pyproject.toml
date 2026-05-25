@@ -30,11 +30,13 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "notion-client>=3.0.0",
     "pandas>=3.0.2",
+    "neo4j>=5.20.0",
 ]
 
 [project.scripts]
 nutrimaster = "nutrimaster.cli:main"
 nutrimaster-export-interactions = "nutrimaster.agent.export_interactions:main"
+nutrimaster-build-graph-index = "nutrimaster.rag.graph.cli:main"
 
 [project.optional-dependencies]
 # 个人知识库 PDF 解析

@@ -115,6 +115,16 @@ const I18N = {
         'source.pubmed': 'PubMed',
         'source.jina_web': '网页',
         'source.personal': '个人库',
+        'source.graph_db': '图谱',
+        'graph.title': '图谱证据',
+        'graph.edgeEvidence': '关系证据',
+        'graph.emptyEvidence': '暂无边证据',
+        'graph.fallback': '图谱资源未加载，显示文本关系',
+        'graph.doi': 'DOI',
+        'graph.summary': '摘要',
+        'graph.validation': '验证',
+        'graph.section': '章节',
+        'graph.source': '来源',
         // 生成控制
         'generation.stopped': '已停止生成',
         'scroll.toBottom': '回到底部',
@@ -263,6 +273,16 @@ const I18N = {
         'source.pubmed': 'PubMed',
         'source.jina_web': 'Web',
         'source.personal': 'Personal',
+        'source.graph_db': 'Graph',
+        'graph.title': 'Graph Evidence',
+        'graph.edgeEvidence': 'Edge Evidence',
+        'graph.emptyEvidence': 'No edge evidence',
+        'graph.fallback': 'Graph library unavailable; showing text relations',
+        'graph.doi': 'DOI',
+        'graph.summary': 'Summary',
+        'graph.validation': 'Validation',
+        'graph.section': 'Section',
+        'graph.source': 'Source',
         'generation.stopped': 'Generation stopped',
         'scroll.toBottom': 'Scroll to bottom',
         'feedback.prompt': 'Was this answer helpful?',
@@ -793,6 +813,7 @@ async function handleSend() {
         answerText: '',
         sources: [],
         toolCalls: [],          // 工具调用记录
+        graphEvidence: [],
         selectedSkill: null,    // 命中的 skill
         experimentRunning: false,
         experimentDone: false,
@@ -805,12 +826,23 @@ async function handleSend() {
         interactionId: '',
         turnId: '',
         feedbackSubmitted: '',
+        thinkingText: '',
     });
 
     try {
         const { answerText, sources } = await streamQuery(query, assistantMsgId);
         const state = getAssistantTurnState(assistantMsgId);
-        saveToHistory(query, answerText, sources, state.genes, state.sops, state.interactionId, state.turnId, state.feedbackSubmitted);
+        saveToHistory(
+            query,
+            answerText,
+            sources,
+            state.genes,
+            state.sops,
+            state.interactionId,
+            state.turnId,
+            state.feedbackSubmitted,
+            state.graphEvidence
+        );
     } catch (error) {
         if (error.name === 'AbortError') {
             // 用户切换了对话，部分回答已在 abortCurrentStream() 中保存
@@ -899,6 +931,26 @@ async function streamQuery(query, messageId) {
     let sources = [];
     let buffer = '';
 
+    const finalizeTurn = () => {
+        const state = getAssistantTurnState(messageId);
+        state.streamDone = true;
+        finalizeThinkingUI(messageId);
+        finalizeToolCallsUI(messageId);
+
+        updateMessage(messageId, formatAnswer(answerText, sources, messageId));
+        const { extrasEl } = getMessageRegions(messageId);
+        if (extrasEl) {
+            extrasEl.querySelectorAll('.references-section').forEach(el => el.remove());
+            renderGraphEvidence(extrasEl, state.graphEvidence);
+            if (sources && sources.length > 0) {
+                extrasEl.insertAdjacentHTML('beforeend', renderReferences(sources, messageId));
+            }
+        }
+        renderExperimentButton(messageId);
+        prefetchTransgenicSpecies(messageId);
+        renderFeedbackControls(messageId);
+    };
+
     while (true) {
         const { done, value } = await reader.read();
         buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
@@ -955,6 +1007,10 @@ async function streamQuery(query, messageId) {
                         answerText = data.data;
                         const state = getAssistantTurnState(messageId);
                         state.answerText = answerText;
+                    } else if (data.type === 'graph_evidence') {
+                        const state = getAssistantTurnState(messageId);
+                        const incoming = Array.isArray(data.data) ? data.data : [data.data];
+                        mergeGraphEvidence(state, incoming);
                     } else if (data.type === 'text') {
                         // 收到正式回答后，结束思考状态
                         finalizeThinkingUI(messageId);
@@ -995,19 +1051,7 @@ async function streamQuery(query, messageId) {
                             state.species = [...data.species];
                         }
                     } else if (data.type === 'done') {
-                        const state = getAssistantTurnState(messageId);
-                        state.streamDone = true;
-                        finalizeThinkingUI(messageId);
-                        finalizeToolCallsUI(messageId);
-
-                        updateMessage(messageId, formatAnswer(answerText, sources, messageId));
-                        const { extrasEl } = getMessageRegions(messageId);
-                        if (extrasEl && sources && sources.length > 0) {
-                            extrasEl.insertAdjacentHTML('beforeend', renderReferences(sources, messageId));
-                        }
-                        renderExperimentButton(messageId);
-                        prefetchTransgenicSpecies(messageId);
-                        renderFeedbackControls(messageId);
+                        finalizeTurn();
                     } else if (data.type === 'error') {
                         const state = getAssistantTurnState(messageId);
                         state.experimentRunning = false;
@@ -1032,18 +1076,7 @@ async function streamQuery(query, messageId) {
                 try {
                     const data = JSON.parse(buffer.trim().slice(6));
                     if (data.type === 'done') {
-                        const state = getAssistantTurnState(messageId);
-                        state.streamDone = true;
-                        finalizeToolCallsUI(messageId);
-                        updateMessage(messageId, formatAnswer(answerText, sources, messageId));
-                        // 在回答末尾追加参考文献
-                        const { extrasEl } = getMessageRegions(messageId);
-                        if (extrasEl && sources && sources.length > 0) {
-                            extrasEl.insertAdjacentHTML('beforeend', renderReferences(sources, messageId));
-                        }
-                        renderExperimentButton(messageId);
-                        prefetchTransgenicSpecies(messageId);
-                        renderFeedbackControls(messageId);
+                        finalizeTurn();
                     }
                 } catch (parseErr) {
                     if (parseErr.message && !parseErr.message.startsWith('Unexpected')) {
@@ -1389,6 +1422,7 @@ function getSourceBadge(sourceType) {
         pubmed:   { key: 'source.pubmed',    cls: 'badge-pubmed' },
         jina_web: { key: 'source.jina_web',  cls: 'badge-web' },
         personal: { key: 'source.personal',  cls: 'badge-personal' },
+        graph_db: { key: 'source.graph_db',  cls: 'badge-graph' },
     };
     const entry = map[sourceType];
     if (entry) return { label: t(entry.key), cls: entry.cls };
@@ -1494,6 +1528,230 @@ function renderReferences(sources, citationScope = '') {
     `;
 }
 
+const GRAPH_NODE_STYLES = {
+    Gene: { shape: 'ellipse', color: { background: '#4A7DD7', border: '#2F5FB8' }, font: { color: '#FFFFFF' } },
+    Metabolite: { shape: 'box', color: { background: '#27AE60', border: '#1E874B' }, font: { color: '#FFFFFF' } },
+    Reaction: { shape: 'diamond', color: { background: '#E67E22', border: '#B9651C' }, font: { color: '#FFFFFF' } },
+    Pathway: { shape: 'box', color: { background: '#7C3AED', border: '#5B21B6' }, font: { color: '#FFFFFF' } },
+    Process: { shape: 'box', color: { background: '#0F766E', border: '#115E59' }, font: { color: '#FFFFFF' } },
+    Signal: { shape: 'triangle', color: { background: '#DB2777', border: '#BE185D' }, font: { color: '#FFFFFF' } },
+    Species: { shape: 'dot', color: { background: '#64748B', border: '#475569' }, font: { color: '#1F2937' } },
+    Phenotype: { shape: 'box', color: { background: '#CA8A04', border: '#A16207' }, font: { color: '#FFFFFF' } },
+};
+
+
+function graphEvidenceKey(graph) {
+    if (!graph) return '';
+    const seeds = Array.isArray(graph.seeds)
+        ? graph.seeds.map(seed => seed && (seed.id || seed.name)).filter(Boolean).join('|')
+        : '';
+    const edges = Array.isArray(graph.edges)
+        ? graph.edges.map(edge => edge && (edge.id || `${edge.src}|${edge.relation}|${edge.dst}`)).filter(Boolean).slice(0, 10).join('|')
+        : '';
+    return [graph.backend || '', graph.query || '', graph.direction || '', graph.hops || '', seeds, edges].join('::');
+}
+
+function mergeGraphEvidence(state, incoming) {
+    if (!state) return;
+    if (!Array.isArray(state.graphEvidence)) state.graphEvidence = [];
+    const seen = new Set(state.graphEvidence.map(graphEvidenceKey));
+    (incoming || []).filter(Boolean).forEach(graph => {
+        const key = graphEvidenceKey(graph);
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        state.graphEvidence.push(graph);
+    });
+}
+
+function renderGraphEvidence(extrasEl, graphEvidence) {
+    if (!extrasEl) return;
+    extrasEl.querySelectorAll('.graph-evidence-section').forEach(el => el.remove());
+
+    const graphs = (graphEvidence || [])
+        .filter(g => g && Array.isArray(g.nodes) && g.nodes.length > 0 && Array.isArray(g.edges) && g.edges.length > 0)
+        .slice(0, 2);
+    if (graphs.length === 0) return;
+
+    const section = document.createElement('div');
+    section.className = 'graph-evidence-section';
+    section.innerHTML = `<div class="graph-evidence-title">${escapeHtml(t('graph.title'))}</div>`;
+    extrasEl.appendChild(section);
+
+    graphs.forEach((graph, index) => {
+        const card = document.createElement('details');
+        card.className = 'graph-evidence-card';
+        card.open = index === 0;
+
+        const seedText = graphSeedText(graph);
+        const edgeCount = Math.min((graph.edges || []).length, 40);
+        const nodeCount = Math.min((graph.nodes || []).length, 80);
+        card.innerHTML = `
+            <summary class="graph-evidence-summary">
+                <span class="graph-evidence-name">${escapeHtml(seedText || graph.query || t('graph.title'))}</span>
+                <span class="graph-meta">backend=${escapeHtml(graph.backend || 'graph_db')}</span>
+                <span class="graph-meta">direction=${escapeHtml(graph.direction || 'both')}</span>
+                <span class="graph-meta">hops=${escapeHtml(String(graph.hops || '?'))}</span>
+                <span class="graph-meta">${nodeCount} nodes / ${edgeCount} edges</span>
+            </summary>
+            <div class="graph-evidence-body">
+                <div class="graph-network" id="graph-network-${index}-${Date.now()}"></div>
+                <div class="graph-edge-panel">
+                    <div class="graph-edge-title">${escapeHtml(t('graph.edgeEvidence'))}</div>
+                    <div class="graph-edge-detail"></div>
+                </div>
+            </div>
+        `;
+        section.appendChild(card);
+        drawGraphEvidence(card, graph);
+    });
+}
+
+function graphSeedText(graph) {
+    const seeds = Array.isArray(graph.seeds) ? graph.seeds : [];
+    const names = seeds.map(seed => seed && (seed.name || seed.id)).filter(Boolean).slice(0, 4);
+    return names.join(', ');
+}
+
+function drawGraphEvidence(card, graph) {
+    const container = card.querySelector('.graph-network');
+    const detailEl = card.querySelector('.graph-edge-detail');
+    if (!container || !detailEl) return;
+
+    const limited = limitGraphForDisplay(graph);
+    const edgeById = new Map();
+    const visNodes = limited.nodes.map(node => {
+        const style = GRAPH_NODE_STYLES[node.type] || {};
+        return {
+            id: node.id,
+            label: shortenGraphLabel(node.name || node.id),
+            title: graphNodeTitle(node),
+            borderWidth: 1,
+            size: node.type === 'Gene' ? 18 : 14,
+            ...style,
+        };
+    });
+    const edgeIdCounts = new Map();
+    const visEdges = limited.edges.map((edge, index) => {
+        const baseId = String(edge.id || `${edge.src}-${edge.dst}-${edge.relation || 'rel'}-${index}`);
+        const count = edgeIdCounts.get(baseId) || 0;
+        edgeIdCounts.set(baseId, count + 1);
+        const id = count === 0 ? baseId : `${baseId}#${count}`;
+        const normalized = { ...edge, id };
+        edgeById.set(id, normalized);
+        return {
+            id,
+            from: edge.src,
+            to: edge.dst,
+            label: shortenGraphLabel(edge.relation || '', 18),
+            arrows: 'to',
+            color: { color: '#94A3B8', highlight: '#4A7DD7' },
+            font: { size: 10, align: 'middle', color: '#475569' },
+            smooth: { type: 'dynamic' },
+        };
+    });
+
+    renderGraphEdgeDetail(detailEl, limited.edges[0]);
+
+    const renderFallback = () => {
+        container.classList.add('graph-network-fallback');
+        container.innerHTML = `<div class="graph-fallback-note">${escapeHtml(t('graph.fallback'))}</div>` +
+            limited.edges.map(edge => `<div class="graph-fallback-edge">${escapeHtml(edge.src)} --${escapeHtml(edge.relation || '')}--> ${escapeHtml(edge.dst)}</div>`).join('');
+    };
+
+    if (typeof vis === 'undefined' || !vis.Network) {
+        renderFallback();
+        return;
+    }
+
+    try {
+        const network = new vis.Network(
+            container,
+            { nodes: new vis.DataSet(visNodes), edges: new vis.DataSet(visEdges) },
+            {
+                physics: { stabilization: true, barnesHut: { springLength: 120, avoidOverlap: 0.2 } },
+                interaction: { hover: true, tooltipDelay: 120, multiselect: false },
+                nodes: { font: { size: 12, face: 'Inter, system-ui, sans-serif' }, margin: 8 },
+                edges: { width: 1.4, selectionWidth: 2.4 },
+            }
+        );
+
+        network.on('selectEdge', params => {
+            const edgeId = params.edges && params.edges[0];
+            renderGraphEdgeDetail(detailEl, edgeById.get(edgeId));
+        });
+        card.addEventListener('toggle', () => {
+            if (card.open) setTimeout(() => network.fit({ animation: true }), 60);
+        });
+    } catch (err) {
+        console.warn('Graph render failed, falling back to edge list:', err);
+        renderFallback();
+    }
+}
+function limitGraphForDisplay(graph) {
+    const rawEdges = Array.isArray(graph.edges) ? graph.edges : [];
+    const seenEdges = new Set();
+    const edges = [];
+    rawEdges.forEach((edge, index) => {
+        if (!edge || !edge.src || !edge.dst) return;
+        const key = edge.id || `${edge.src}|${edge.relation || ''}|${edge.dst}|${edge.evidence?.doi || ''}|${index}`;
+        if (seenEdges.has(key)) return;
+        seenEdges.add(key);
+        edges.push(edge);
+    });
+    const limitedEdges = edges.slice(0, 40);
+
+    const edgeNodeIds = new Set();
+    limitedEdges.forEach(edge => {
+        edgeNodeIds.add(edge.src);
+        edgeNodeIds.add(edge.dst);
+    });
+
+    const nodeMap = new Map();
+    (Array.isArray(graph.nodes) ? graph.nodes : []).forEach(node => {
+        if (!node || !node.id) return;
+        if (edgeNodeIds.size > 0 && !edgeNodeIds.has(node.id)) return;
+        if (!nodeMap.has(node.id)) nodeMap.set(node.id, node);
+    });
+    const nodes = Array.from(nodeMap.values()).slice(0, 80);
+    const nodeIds = new Set(nodes.map(node => node.id));
+    return { nodes, edges: limitedEdges.filter(edge => nodeIds.has(edge.src) && nodeIds.has(edge.dst)) };
+}
+function graphNodeTitle(node) {
+    const parts = [node.name || node.id, node.type, node.species].filter(Boolean);
+    return escapeHtml(parts.join(' | '));
+}
+
+function shortenGraphLabel(value, max = 28) {
+    const text = String(value || '');
+    return text.length > max ? text.slice(0, max - 1) + '…' : text;
+}
+
+function renderGraphEdgeDetail(detailEl, edge) {
+    if (!detailEl) return;
+    if (!edge) {
+        detailEl.innerHTML = `<div class="graph-empty">${escapeHtml(t('graph.emptyEvidence'))}</div>`;
+        return;
+    }
+    const evidence = edge.evidence || {};
+    const doi = evidence.doi || '';
+    const doiHref = doi ? citationHref({ doi }) : '';
+    const doiHtml = doi
+        ? `<a href="${escapeHtml(doiHref)}" target="_blank" rel="noopener">${escapeHtml(doi)}</a>`
+        : '';
+    const rows = [
+        [t('graph.doi'), doiHtml],
+        [t('graph.summary'), escapeHtml(evidence.summary || '')],
+        [t('graph.validation'), escapeHtml(evidence.validation || '')],
+        [t('graph.section'), escapeHtml(evidence.section || '')],
+        [t('graph.source'), escapeHtml(evidence.source_file || evidence.title || '')],
+    ].filter(([, value]) => value);
+
+    detailEl.innerHTML = `
+        <div class="graph-edge-relation">${escapeHtml(edge.src || '')} --${escapeHtml(edge.relation || '')}--> ${escapeHtml(edge.dst || '')}</div>
+        ${rows.map(([label, value]) => `<div class="graph-edge-row"><span>${escapeHtml(label)}</span><strong>${value}</strong></div>`).join('')}
+    `;
+}
+
 // 添加消息
 function addMessage(role, content) {
     const messageId = `msg-${Date.now()}-${Math.random()}`;
@@ -1550,6 +1808,7 @@ function getAssistantTurnState(messageId) {
             answerText: '',
             sources: [],
             toolCalls: [],        // [{tool, args, done, summary, result}]
+            graphEvidence: [],
             selectedSkill: null,   // skill name string
             experimentRunning: false,
             experimentDone: false,
@@ -1636,6 +1895,10 @@ function finalizeToolCallsUI(messageId) {
         detailHtml += `<div class="tool-call-item"><span class="tool-call-name">${escapeHtml(tc.tool)}</span>`;
         if (truncArgs) {
             detailHtml += ` <span class="tool-call-args">${escapeHtml(truncArgs)}</span>`;
+        }
+        if (tc.summary) {
+            const summary = tc.summary.length > 260 ? tc.summary.slice(0, 260) + '...' : tc.summary;
+            detailHtml += `<div class="tool-call-summary-text">${escapeHtml(summary)}</div>`;
         }
         if (tc.result) {
             detailHtml += `
@@ -2059,11 +2322,12 @@ function persistConversationHistory() {
 }
 
 // 保存到历史
-function saveToHistory(query, answerText, sources, genes, sops, interactionId, turnId, feedbackSubmitted) {
+function saveToHistory(query, answerText, sources, genes, sops, interactionId, turnId, feedbackSubmitted, graphEvidence) {
     const turn = { query, answerText, sources, timestamp: Date.now() };
     // 保存基因列表和 SOP 结果（用于切换对话后重新渲染，不会发给 LLM）
     if (genes && genes.length > 0) turn.genes = genes;
     if (sops && Object.keys(sops).length > 0) turn.sops = sops;
+    if (graphEvidence && graphEvidence.length > 0) turn.graphEvidence = graphEvidence.slice(0, 2);
     if (interactionId) turn.interactionId = interactionId;
     if (turnId) turn.turnId = turnId;
     if (feedbackSubmitted) turn.feedback = feedbackSubmitted;
@@ -2218,6 +2482,7 @@ function restoreConversation(session) {
         state.query = turn.query;
         state.answerText = turn.answerText || '';
         state.sources = turn.sources || [];
+        state.graphEvidence = turn.graphEvidence || [];
         state.genes = turn.genes ? [...turn.genes] : [];
         state.interactionId = turn.interactionId || '';
         state.turnId = turn.turnId || '';
@@ -2231,6 +2496,9 @@ function restoreConversation(session) {
         // 恢复来源、基因、SOP 到 extrasEl
         const { extrasEl } = getMessageRegions(msgId);
         if (extrasEl) {
+            if (turn.graphEvidence && turn.graphEvidence.length > 0) {
+                renderGraphEvidence(extrasEl, turn.graphEvidence);
+            }
             // 在回答末尾追加参考文献
             if (turn.sources && turn.sources.length > 0) {
                 extrasEl.insertAdjacentHTML('beforeend', renderReferences(turn.sources, msgId));

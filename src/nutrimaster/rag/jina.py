@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import pickle
 import time
 from collections.abc import Callable, Sequence
@@ -13,6 +14,7 @@ import requests
 from nutrimaster.config.settings import Settings
 from nutrimaster.rag.bm25 import BM25Retriever, rrf_fuse
 from nutrimaster.rag.gene_index import GeneChunk, IndexService
+from nutrimaster.rag.jina_proxy import jina_proxy_request_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +89,17 @@ def _post_with_retry(
     last_exc = None
     for attempt in range(max_retries):
         try:
-            response = post(url, json=payload, headers=headers, timeout=timeout)
+            if post is requests.post:
+                with jina_proxy_request_kwargs() as request_kwargs:
+                    response = post(
+                        url,
+                        json=payload,
+                        headers=headers,
+                        timeout=timeout,
+                        **request_kwargs,
+                    )
+            else:
+                response = post(url, json=payload, headers=headers, timeout=timeout)
             if response.status_code == 429:
                 time.sleep(min(30, 5 * (attempt + 1)))
                 continue
@@ -266,7 +278,14 @@ class JinaReranker:
         Raises:
             requests.exceptions.HTTPError: 当 HTTP 响应状态码表示错误时抛出。
         """
-        response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        with jina_proxy_request_kwargs() as request_kwargs:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+                **request_kwargs,
+            )
         response.raise_for_status()
         return response.json()
 
@@ -409,7 +428,8 @@ class JinaRetriever:
             try:
                 with chunks_file.open("rb") as file:
                     chunks = pickle.load(file)
-                embeddings = np.load(embeddings_file)
+                mmap_enabled = os.getenv("NUTRIMASTER_RAG_MMAP_EMBEDDINGS", "1").lower() not in {"0", "false", "no", "off"}
+                embeddings = np.load(embeddings_file, mmap_mode="r" if mmap_enabled else None)
             except Exception as exc:
                 self.chunks = []
                 self.embeddings = None
@@ -593,6 +613,8 @@ class JinaRetriever:
 
         candidate_k = max(top_k, rerank_top_n)
         dense_ranked = self._dense_search_indices(query, top_k=candidate_k)
+        if os.getenv("NUTRIMASTER_DISABLE_BM25", "").lower() in {"1", "true", "yes", "on"}:
+            return [(self.chunks[index], score) for index, score in dense_ranked[:top_k]]
         bm25 = self._ensure_bm25()
         if bm25 is None:
             return [(self.chunks[index], score) for index, score in dense_ranked[:top_k]]

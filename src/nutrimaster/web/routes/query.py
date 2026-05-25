@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from nutrimaster.auth.service import get_current_user
+from nutrimaster.rag.evidence import extract_graph_evidence
 from nutrimaster.web.deps import SSE_HEADERS, WebServices, get_services, sse
 
 logger = logging.getLogger(__name__)
@@ -224,6 +225,7 @@ async def rag_search_debug(
             "mode": packet.mode,
             "source_counts": packet.source_counts,
             "citations": packet.citations,
+            "graph_evidence": extract_graph_evidence(packet),
             "text": packet.to_tool_text(),
         }
     )

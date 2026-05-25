@@ -50,6 +50,7 @@ class RAGSearchService:
         *,
         pubmed_source: Any,
         gene_db_source: Any,
+        graph_source: Any | None = None,
         personal_source: Any | None = None,
         fusion: EvidenceFusion | None = None,
         source_collector: SourceCollector | None = None,
@@ -65,6 +66,7 @@ class RAGSearchService:
         """
         self.pubmed_source = pubmed_source
         self.gene_db_source = gene_db_source
+        self.graph_source = graph_source
         self.personal_source = personal_source
         self.fusion = fusion or EvidenceFusion()
         self.source_collector = source_collector or SourceCollector()
@@ -90,6 +92,13 @@ class RAGSearchService:
             "pubmed": self._safe_search(self.pubmed_source, pubmed_query, top_k=source_budget["pubmed"], context=context),
             "gene_db": self._safe_search(self.gene_db_source, gene_db_query, top_k=source_budget["gene_db"], context=context),
         }
+        if self.graph_source is not None:
+            tasks["graph_db"] = self._safe_search(
+                self.graph_source,
+                gene_db_query,
+                top_k=source_budget["graph_db"],
+                context=context,
+            )
         if context.include_personal and self.personal_source is not None:
             tasks["personal"] = self._safe_search(
                 self.personal_source,
@@ -127,8 +136,8 @@ class RAGSearchService:
             各来源名称到配额数量的映射字典。
         """
         if context.mode == "deep":
-            return {"pubmed": 12, "gene_db": 20, "personal": 12}
-        return {"pubmed": 6, "gene_db": 12, "personal": 8}
+            return {"pubmed": 12, "gene_db": 20, "graph_db": 8, "personal": 12}
+        return {"pubmed": 6, "gene_db": 12, "graph_db": 4, "personal": 8}
 
     @staticmethod
     def _empty_source_warnings(source_counts: dict[str, int]) -> list[str]:

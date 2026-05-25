@@ -8,7 +8,13 @@ import re
 from nutrimaster.agent.prompts import PromptBuilder
 from nutrimaster.experiment import extract_gene_names
 from nutrimaster.experiment.gene_validation import extract_transgenic_species_with_llm
-from nutrimaster.rag.evidence import CitationRegistry, EvidencePacket, evidence_key
+from nutrimaster.rag.evidence import (
+    CitationRegistry,
+    EvidencePacket,
+    evidence_key,
+    extract_graph_evidence,
+    summarize_graph_evidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -293,15 +299,24 @@ class Agent:
                         global_packet = citation_registry.assign_packet(result)
                         evidence_packets.append(global_packet)
                         tool_content = global_packet.to_tool_text()
+                        graph_evidence = extract_graph_evidence(global_packet)
+                        if graph_evidence:
+                            yield {"type": "graph_evidence", "data": graph_evidence}
+                        tool_summary = summarize_graph_evidence(graph_evidence) or tool_content[:500]
                     elif hasattr(result, "to_tool_text"):
                         tool_content = result.to_tool_text()
+                        tool_summary = tool_content[:500]
                     else:
                         tool_content = str(result)
+                        tool_summary = tool_content[:500]
+                    tool_display = tool_summary
+                    if len(tool_content) > 500:
+                        tool_display += "\n...(full tool result is kept for model context; UI shows summary only)"
                     yield {
                         "type": "tool_result",
                         "tool": tool_name,
-                        "summary": tool_content[:500],
-                        "content": tool_content,
+                        "summary": tool_summary,
+                        "content": tool_display,
                     }
                     messages.append(
                         {

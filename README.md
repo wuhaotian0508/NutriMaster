@@ -188,6 +188,19 @@ uv run nutrimaster web
 - Web 应用：`http://localhost:5000`
 - Admin 面板：`http://localhost:5000/admin`
 
+### SQLite 图 RAG 可视化
+
+网页会在回答下方展示 SQLite 图 RAG 返回的节点和关系证据。先在本地构建图索引：
+
+```bash
+python3 -m nutrimaster.rag.graph.cli --backend sqlite --corpus data/corpus --out data/index/graph_index.sqlite
+export NUTRIMASTER_GRAPH_BACKEND=sqlite
+```
+
+启动 Web 后，`rag_search` 命中 `source_type=graph_db` 时会通过 SSE 推送 `graph_evidence`，前端使用本地 `/static/vendor/vis-network/` 资源渲染图谱证据卡片。没有 `data/index/graph_index.sqlite` 时，普通 PubMed/GeneDB RAG 仍会正常工作，只是不显示图谱卡片。
+
+根目录 `graph/` 是历史空目录，可删除；`graphing/` 是旧静态可视化目录，`vis-network` 已迁移到 Web 静态目录后也可清理。
+
 生产或部署环境可直接使用 Uvicorn：
 
 ```bash

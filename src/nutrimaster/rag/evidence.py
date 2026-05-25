@@ -297,6 +297,154 @@ class EvidencePacket:
         return self.to_tool_text()
 
 
+def extract_graph_evidence(
+    packet: EvidencePacket,
+    *,
+    max_graphs: int | None = None,
+    max_edges: int = 40,
+    max_nodes: int = 80,
+) -> list[dict[str, Any]]:
+    """从 EvidencePacket 中提取可公开展示的图 RAG 执行证据。
+
+    这里展示的是工具检索到的节点、边和边上证据，不包含模型隐藏推理。
+    SQLite 图源已经在 metadata 中提供 nodes/edges；Neo4j 图源则从 paths
+    里摊平成同样的结构，方便前端统一渲染。
+    """
+    graphs: list[dict[str, Any]] = []
+    for item in packet.items:
+        if item.source_type != "graph_db":
+            continue
+        metadata = item.metadata if isinstance(item.metadata, dict) else {}
+        nodes, edges = _graph_nodes_edges(metadata)
+        if not nodes or not edges:
+            continue
+
+        edges = edges[:max_edges]
+        nodes = _limit_graph_nodes(nodes, edges, max_nodes=max_nodes)
+        if not nodes:
+            continue
+
+        graphs.append(
+            {
+                "query": metadata.get("query") or packet.query,
+                "backend": metadata.get("backend") or "graph_db",
+                "seeds": _as_list(metadata.get("seeds") or metadata.get("starts") or metadata.get("targets")),
+                "nodes": nodes,
+                "edges": edges,
+                "direction": metadata.get("direction") or "",
+                "hops": metadata.get("hops") or metadata.get("max_hops") or "",
+            }
+        )
+        if max_graphs is not None and len(graphs) >= max_graphs:
+            break
+    return graphs
+
+
+def summarize_graph_evidence(graphs: list[dict[str, Any]]) -> str:
+    """生成工具折叠区使用的短文本摘要。"""
+    if not graphs:
+        return ""
+    parts = []
+    for graph in graphs[:2]:
+        seeds = graph.get("seeds") or []
+        seed_names = [
+            clean_text(seed.get("name") or seed.get("id") or "")
+            for seed in seeds
+            if isinstance(seed, dict)
+        ]
+        seed_text = "、".join(seed_names[:4]) or "未明确匹配主体"
+        direction = graph.get("direction") or "both"
+        hops = graph.get("hops") or "?"
+        backend = graph.get("backend") or "graph_db"
+        parts.append(
+            f"图 RAG 检索主体: {seed_text}; 方向: {direction}; hops: {hops}; "
+            f"backend: {backend}; 返回 {len(graph.get('nodes') or [])} 个节点、{len(graph.get('edges') or [])} 条边"
+        )
+    return " | ".join(parts)
+
+
+def _graph_nodes_edges(metadata: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    nodes = _as_list(metadata.get("nodes"))
+    edges = _as_list(metadata.get("edges"))
+    if nodes and edges:
+        return [_clean_node(node) for node in nodes], [_clean_edge(edge) for edge in edges]
+
+    path_nodes: dict[str, dict[str, Any]] = {}
+    path_edges: list[dict[str, Any]] = []
+    for path in _as_list(metadata.get("paths")):
+        if not isinstance(path, dict):
+            continue
+        for node in _as_list(path.get("nodes")):
+            clean = _clean_node(node)
+            if clean.get("id"):
+                path_nodes.setdefault(clean["id"], clean)
+        for rel in _as_list(path.get("relationships")):
+            edge = _clean_edge(
+                {
+                    **rel,
+                    "src": rel.get("src") or rel.get("source_id"),
+                    "dst": rel.get("dst") or rel.get("target_id"),
+                    "relation": rel.get("relation") or rel.get("type"),
+                }
+            )
+            if edge.get("src") and edge.get("dst"):
+                path_edges.append(edge)
+    return list(path_nodes.values()), path_edges
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else list(value) if isinstance(value, tuple) else []
+
+
+def _clean_node(node: Any) -> dict[str, Any]:
+    if not isinstance(node, dict):
+        return {}
+    return {
+        key: clean_text(node.get(key))
+        for key in ("id", "type", "name", "species")
+        if clean_text(node.get(key))
+    }
+
+
+def _clean_edge(edge: Any) -> dict[str, Any]:
+    if not isinstance(edge, dict):
+        return {}
+    evidence = edge.get("evidence") if isinstance(edge.get("evidence"), dict) else {}
+    cleaned = {
+        "id": clean_text(edge.get("id")),
+        "src": clean_text(edge.get("src") or edge.get("source_id")),
+        "dst": clean_text(edge.get("dst") or edge.get("target_id")),
+        "relation": clean_text(edge.get("relation") or edge.get("type")),
+        "evidence": {
+            key: clean_text(evidence.get(key))
+            for key in ("doi", "summary", "validation", "section", "journal", "title", "source_file", "mode")
+            if clean_text(evidence.get(key))
+        },
+    }
+    return {key: value for key, value in cleaned.items() if value not in ("", {})}
+
+
+def _limit_graph_nodes(nodes: list[dict[str, Any]], edges: list[dict[str, Any]], *, max_nodes: int) -> list[dict[str, Any]]:
+    edge_node_ids = []
+    for edge in edges:
+        for key in ("src", "dst"):
+            node_id = edge.get(key)
+            if node_id and node_id not in edge_node_ids:
+                edge_node_ids.append(node_id)
+
+    by_id = {node.get("id"): node for node in nodes if node.get("id")}
+    output = [by_id[node_id] for node_id in edge_node_ids if node_id in by_id]
+    if len(output) < min(max_nodes, len(nodes)):
+        seen = {node.get("id") for node in output}
+        for node in nodes:
+            if len(output) >= max_nodes:
+                break
+            if node.get("id") and node.get("id") not in seen:
+                output.append(node)
+                seen.add(node.get("id"))
+    return output[:max_nodes]
+
+
 class EvidenceFusion:
     """多来源证据融合器：合并来自不同检索源的结果，同时确保每个来源都有覆盖。"""
 
