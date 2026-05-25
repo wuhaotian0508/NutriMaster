@@ -48,8 +48,8 @@ NutriMaster 是一个面向植物营养与代谢基因知识库的抽取、检�
 │   ├── config/             # 集中配置（settings.py）
 │   ├── auth/               # Supabase 认证集成
 │   └── experiment/         # 实验功能（CRISPR、基因转化）
-├── eval/                   # 评测框架
-├── graphing/               # 基因图谱可视化工具
+├── eval/                   # NutriBench 评测框架（task × model 正交设计，支持 Notion 集成）
+├── graphing/               # 基因通路图谱构建与可视化工具
 ├── tests/                  # 单元、集成和 e2e 测试
 ├── logs/
 ├── DEVELOPMENT.md          # 协作开发与维护指南
@@ -167,6 +167,17 @@ TEMPERATURE=0.7
 MAX_WORKERS=20
 ```
 
+评测框架配置（仅使用 `eval/` 时需要）：
+
+```bash
+NOTION_API_KEY=secret_xxx
+QUESTION_DB_ID=...
+RESULT_DB_ID=...
+JUDGE_MODEL=Vendor2/Gemini-3.1-pro
+LLM_API_KEY=sk-xxx
+LLM_BASE_URL=https://...
+```
+
 检查真实服务所需配置：
 
 ```bash
@@ -210,7 +221,6 @@ uv run uvicorn nutrimaster.web.app:app --host 0.0.0.0 --port 5000
 ## Admin
 
 Admin 挂载在主 Web 应用的 `/admin` 路径下，不再维护独立 Flask 启动命令。功能包括上传论文 ZIP、去重、单篇预览、批量抽取与验证、SSE 进度、prompt/schema 编辑、索引重建和已处理论文列表。Admin 访问由 `ADMIN_EMAIL` 白名单控制。
-- `POST /api/query/stream`
 
 如果希望启动时自动构建索引，设置：
 
@@ -314,6 +324,41 @@ src/nutrimaster/experiment/crispr/templates/
 src/nutrimaster/experiment/gene_transfer/templates/
 ```
 
+## 基因图谱可视化
+
+`graphing/` 目录提供从主语料构建基因通路图谱并导出多种格式的工具脚本。
+
+额外依赖：
+
+```bash
+pip install networkx matplotlib pyvis
+```
+
+常用命令（在仓库根目录执行）：
+
+```bash
+# 构建通路图，导出 GraphML / GML / JSON / 采样 PNG
+python graphing/build_pathway_graph.py
+
+# 快速生成完整通路图 PNG 预览（随机布局）
+python graphing/build_fast_graph.py
+
+# 生成完整静态 PNG（spring layout，较慢）
+python graphing/build_full_static_graph.py
+
+# 生成完整交互式 HTML
+python graphing/build_full_graph_html.py
+
+# 从 CSV 节点/边数据生成交互式 HTML
+python graphing/visualize_gene_graph.py
+```
+
+输出产物位于 `graphing/output/`，包括 `.graphml`、`.gml`、`.json`、`.png` 和 `.html`。
+
+输入数据约定：通路图脚本默认读取 `data/corpus/*.json` 中每篇文献的 `Pathway_Genes` 字段（`Gene_Name`、`Primary_Substrate`、`Primary_Product`）。
+
+完整图规模较大，`build_full_static_graph.py` 和 `build_full_graph_html.py` 在远程机器上建议用 `tmux` 运行。
+
 ## 测试
 
 运行测试：
@@ -350,6 +395,37 @@ NUTRIMASTER_E2E_BASE_URL=...
 NUTRIMASTER_E2E_EMAIL=...
 NUTRIMASTER_E2E_PASSWORD=...
 ```
+
+## NutriBench 评测框架
+
+`eval/` 目录实现了基于 **task × model 正交分离** 设计的评测框架，用于对 NutriMaster 及对比 Agent 进行标准化问答评测。
+
+支持的 Agent：`nutrimaster`（RAG 问答）、`llm`（通用 LLM 基线）、`evomaster`（工具使用）。
+
+### 推荐流程
+
+```bash
+# 1. 从 Notion 下载题目到本地
+python -m eval.main pull --after 2026-05-06
+
+# 2. 本地评测（--resume 支持断点续传）
+python -m eval.main nutrimaster v3 --resume
+
+# 3. 预览后上传结果到 Notion
+python -m eval.main push --dry-run
+python -m eval.main push
+```
+
+### 常用选项
+
+```bash
+python -m eval.main nutrimaster v3                          # 单 Agent 评测
+python -m eval.main nutrimaster v3 --max-questions 5        # 限制题目数（调试）
+python -m eval.main nutrimaster v3 --resume --retry-failed  # 重跑失败题目
+python -m eval.metrics.filter_stats --file eval/data/results/latest.jsonl --agent NutriMaster
+```
+
+断点续传默认每 5 题保存一次检查点；检查点管理详见 `python -m eval.checkpoint_cli`。完整用法见 `eval/README.md`。
 
 ## 协作开发
 

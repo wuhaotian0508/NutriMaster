@@ -1,14 +1,47 @@
-# ── Environment ──────────────────────────────────────────────────────────────
+# ── Environment-related (required) ───────────────────────────────────────────
+# Environment
 .env
 .env.*
 !.env.example
 .eval_env
 
-# ── Virtual environments ──────────────────────────────────────────────────────
+# Virtual environments
 venv/
 env/
 .venv/
 
+# ── Generated data (required) ─────────────────────────────────────────────────
+# Extraction pipeline
+src/nutrimaster/extraction/input/processed/
+src/nutrimaster/extraction/output/
+src/nutrimaster/extraction/reports/
+
+# RAG index (regenerable)
+data/index/*
+!data/index/.gitkeep
+
+# Corpus (primary asset — protect with explicit tracking)
+data/corpus/*
+!data/corpus/.gitkeep
+
+# User runtime data
+data/personal_lib/
+data/user_skills/
+data/uploads/
+data/jobs/
+data/interactions/
+
+# Backup directories
+data/backup_*/
+data/index-backup-*/
+/data-backup/
+
+# Logs
+*.log
+logs/
+
+
+# Others
 # ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 **/__pycache__/
@@ -41,38 +74,6 @@ Thumbs.db
 .claude/
 .codex/
 opencode.json
-
-# ── Logs ─────────────────────────────────────────────────────────────────────
-*.log
-logs/
-
-# ── Runtime / generated data (primary assets excluded below) ─────────────────
-# Extraction pipeline
-src/nutrimaster/extraction/input/processed/
-src/nutrimaster/extraction/output/
-src/nutrimaster/extraction/reports/
-
-# RAG index (regenerable)
-data/index/*
-!data/index/.gitkeep
-
-# Corpus: primary asset — protect with explicit tracking
-data/corpus/*
-!data/corpus/.gitkeep
-
-# User runtime data
-data/personal_lib/
-data/user_skills/
-data/uploads/
-data/jobs/
-
-# Backup directories
-data/backup_*/
-data/index-backup-*/
-/data-backup/
-
-# ── Evaluation ───────────────────────────────────────────────────────────────
-.eval_checkpoints/
 
 # ── Local workspace scratch ───────────────────────────────────────────────────
 *.local
