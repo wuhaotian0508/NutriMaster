@@ -14,9 +14,15 @@ import requests
 from nutrimaster.config.settings import Settings
 from nutrimaster.rag.bm25 import BM25Retriever, rrf_fuse
 from nutrimaster.rag.gene_index import GeneChunk, IndexService
-from nutrimaster.rag.jina_proxy import jina_proxy_request_kwargs
 
 logger = logging.getLogger(__name__)
+
+
+def _get_proxy_kwargs() -> dict:
+    url = os.getenv("NUTRIMASTER_PROXY_URL")
+    if url:
+        return {"proxies": {"http": url, "https": url}}
+    return {}
 
 
 def _current_settings() -> Settings:
@@ -89,17 +95,8 @@ def _post_with_retry(
     last_exc = None
     for attempt in range(max_retries):
         try:
-            if post is requests.post:
-                with jina_proxy_request_kwargs() as request_kwargs:
-                    response = post(
-                        url,
-                        json=payload,
-                        headers=headers,
-                        timeout=timeout,
-                        **request_kwargs,
-                    )
-            else:
-                response = post(url, json=payload, headers=headers, timeout=timeout)
+            _proxy_kwargs = _get_proxy_kwargs()
+            response = post(url, json=payload, headers=headers, timeout=timeout, **_proxy_kwargs)
             if response.status_code == 429:
                 time.sleep(min(30, 5 * (attempt + 1)))
                 continue
@@ -278,14 +275,14 @@ class JinaReranker:
         Raises:
             requests.exceptions.HTTPError: 当 HTTP 响应状态码表示错误时抛出。
         """
-        with jina_proxy_request_kwargs() as request_kwargs:
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=timeout,
-                **request_kwargs,
-            )
+        _proxy_kwargs = _get_proxy_kwargs()
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+            **_proxy_kwargs,
+        )
         response.raise_for_status()
         return response.json()
 

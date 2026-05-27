@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pickle
 import re
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,6 @@ import numpy as np
 import requests
 
 from nutrimaster.config.settings import RagSettings, Settings
-from nutrimaster.rag.jina_proxy import jina_proxy_request_kwargs
 
 _SAFE_FILENAME_RE = re.compile(r"[^\w\u4e00-\u9fff\-. ]", re.UNICODE)
 
@@ -349,21 +349,22 @@ class PersonalLibrary:
         api_key = Settings.from_env().jina_api_key
         if not api_key:
             raise RuntimeError("JINA_API_KEY is required")
-        with jina_proxy_request_kwargs() as request_kwargs:
-            response = requests.post(
-                self.rag_settings.jina_embedding_url,
-                json={
-                    "model": self.rag_settings.embedding_model,
-                    "input": texts,
-                    "task": "retrieval.passage",
-                },
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                timeout=60,
-                **request_kwargs,
-            )
+        proxy_url = os.getenv("NUTRIMASTER_PROXY_URL")
+        _proxy_kwargs = {"proxies": {"http": proxy_url, "https": proxy_url}} if proxy_url else {}
+        response = requests.post(
+            self.rag_settings.jina_embedding_url,
+            json={
+                "model": self.rag_settings.embedding_model,
+                "input": texts,
+                "task": "retrieval.passage",
+            },
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=60,
+            **_proxy_kwargs,
+        )
         response.raise_for_status()
         return np.array([item["embedding"] for item in response.json()["data"]])
 
