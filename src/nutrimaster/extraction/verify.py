@@ -16,7 +16,7 @@ from typing import Optional, List, Tuple
 
 from .config import (
     EXTRACTOR_MODEL, OUTPUT_DIR, REPORTS_DIR, PROCESSED_DIR,
-    get_openai_client,
+    get_openai_client, read_markdown_bounded,
 )
 from .text_utils import preprocess_md_for_llm
 from .token_tracker import TokenTracker
@@ -262,6 +262,8 @@ def _call_verify_api(api_client, model_name: str, user_prompt: str,
         }
         verify_params = prepare_deepseek_params(model_name, verify_params)
         response = api_client.chat.completions.create(**verify_params)
+    except MemoryError:
+        raise
     except Exception as e:
         print(f"    ❌ [{model_name}] API error (verify): {e}")
         return [], False
@@ -504,8 +506,27 @@ def _save_verification_results(
     # Write corrected verified JSON
     verified_json_path = OUTPUT_DIR / f"{stem}_nutri_plant_verified.json"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with open(verified_json_path, "w", encoding="utf-8") as f:
-        json.dump(verified_data, f, indent=2, ensure_ascii=False)
+    verified_tmp_path = verified_json_path.with_name(
+        f".{verified_json_path.name}.{os.getpid()}.tmp"
+    )
+    verified_tmp_path.unlink(missing_ok=True)
+    try:
+        with verified_tmp_path.open("x", encoding="utf-8") as f:
+            json.dump(verified_data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(verified_tmp_path, verified_json_path)
+        directory_fd = os.open(
+            OUTPUT_DIR,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        verified_tmp_path.unlink(missing_ok=True)
     print(f"\n  ✅ Verified JSON saved: {verified_json_path}")
 
     # Save verification report
@@ -566,8 +587,7 @@ def verify_paper(
     print(f"{'=' * 60}")
 
     # Read and preprocess
-    with open(md_path, "r", encoding="utf-8") as f:
-        md_content = f.read()
+    md_content = read_markdown_bounded(md_path)
     original_len = len(md_content)
     md_content = preprocess_md_for_llm(md_content, tracker=tracker)
     print(f"  📏 Preprocessing: {original_len:,} → {len(md_content):,} chars (saved {original_len - len(md_content):,})")

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from nutrimaster.experiment.gene_transfer.gene2updown import GeneSequenceResult
+from nutrimaster.experiment.resource_limits import SOPOutputBudget
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,7 @@ def run_gene_transfer_design(
         dict[str, str]: 以物种名为键、Markdown SOP 文本为值的字典。
     """
     sops: dict[str, str] = {}
+    sop_budget = SOPOutputBudget()
     is_multi = len(gene_results) > 1
 
     for species in species_list:
@@ -148,6 +150,7 @@ def run_gene_transfer_design(
             # 单基因时仍然填充 oligo 块
             template = template.replace(_OLIGO_BLOCK_TEMPLATE, _build_oligo_block(gene_results[0]))
 
+        sop_budget.consume(template, label=species)
         sops[species] = template
 
     return sops

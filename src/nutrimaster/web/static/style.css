@@ -967,6 +967,11 @@ body {
     color: var(--primary-color);
 }
 
+.action-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+}
+
 .attach-btn {
     background: none;
     border: none;

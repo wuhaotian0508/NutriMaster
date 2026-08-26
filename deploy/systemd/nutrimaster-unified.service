@@ -1,0 +1,40 @@
+[Unit]
+Description=NutriMaster unified FastAPI service
+After=network-online.target nutrimaster-pi.service
+Wants=network-online.target
+Wants=nutrimaster-pi.service
+Wants=nutrimaster-bohrium-proxy.socket
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Slice=nutrimaster.slice
+User=root
+WorkingDirectory=/root/code/nutrimaster-current
+ExecStart=/root/code/nutrimaster-current/start-unified-production.sh
+Restart=on-failure
+RestartSec=5
+# Pi/SSE turns may run for 300 seconds. Allow them to drain, then retain one
+# minute for connection teardown before systemd escalates to SIGKILL.
+TimeoutStopSec=360
+KillSignal=SIGTERM
+KillMode=control-group
+MemoryAccounting=true
+# systemd 239 on the production host uses cgroup v1. Keep MemoryLimit and
+# MemoryMax identical so its compatibility branch writes that common value to
+# memory.limit_in_bytes; v2 enforces MemoryMax directly. MemoryHigh and
+# MemorySwapMax only take effect on v2.
+MemoryHigh=2G
+MemoryMax=3G
+MemoryLimit=3G
+MemorySwapMax=0
+# If the shared slice, rather than this service cgroup, reaches its hard limit,
+# keep the request-serving process less attractive than builder/Pi processes.
+OOMScoreAdjust=-500
+TasksMax=256
+LimitNOFILE=65536
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

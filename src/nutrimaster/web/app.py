@@ -15,7 +15,8 @@ from starlette.middleware.wsgi import WSGIMiddleware
 
 from nutrimaster.config.settings import Settings
 from nutrimaster.web.deps import create_services
-from nutrimaster.web.routes import admin, auth, experiment, library, query, system
+from nutrimaster.web.request_limits import RequestBodyLimitMiddleware
+from nutrimaster.web.routes import admin, auth, experiment, library, pi, query, system
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if settings.rag is None:
         raise RuntimeError("RAG settings failed to initialize")
 
-    app = FastAPI(title="NutriMaster", docs_url=None, redoc_url=None)
+    app = FastAPI(title="NutriMaster", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     logger.info("正在初始化 Web 服务与检索索引...")
     app.state.services = create_services(settings)
@@ -108,6 +109,10 @@ def _install_exception_handlers(app: FastAPI) -> None:
         返回:
             JSONResponse: 包含通用错误提示的 500 状态码响应。
         """
+        if isinstance(exc, MemoryError):
+            # Allocator exhaustion is a process-capacity signal. Avoid a
+            # traceback log and synthetic JSON allocation while memory is low.
+            raise exc
         if isinstance(exc, HTTPException):
             raise exc
         logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
@@ -122,32 +127,20 @@ def _install_upload_limit(app: FastAPI) -> None:
     参数:
         app: FastAPI 应用实例。
     """
-    max_upload_bytes = 50 * 1024 * 1024
-
-    @app.middleware("http")
-    async def limit_upload_size(request: Request, call_next):
-        """HTTP 中间件：检查上传文件大小是否超过限制。
-
-        参数:
-            request: 当前 HTTP 请求对象。
-            call_next: 调用链中的下一个中间件或路由处理函数。
-
-        返回:
-            Response: 正常响应或 413 文件过大错误响应。
-        """
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > max_upload_bytes:
-                    return JSONResponse({"error": "文件过大，最大 50MB"}, status_code=413)
-            except ValueError:
-                pass
-        return await call_next(request)
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_bytes=50 * 1024 * 1024,
+        # Starlette's WSGI adapter concatenates the complete body before Flask
+        # authentication runs. Serialize Admin mutations so several allowed
+        # 50MiB requests cannot become an aggregate pre-authentication OOM.
+        serialized_body_prefixes=("/admin/",),
+    )
 
 
 def _install_routes(app: FastAPI) -> None:
     """注册所有 API 路由。"""
     app.include_router(query.router)
+    app.include_router(pi.router)
     app.include_router(experiment.router)
     app.include_router(library.router)
     app.include_router(admin.router)
@@ -169,16 +162,29 @@ def _install_static(app: FastAPI) -> None:
 def _mount_extraction_admin(app: FastAPI) -> None:
     """挂载 Flask extraction admin 蓝图到 /admin 路径。"""
     from flask import Flask as FlaskApp
-    from nutrimaster.web.admin.app import admin_bp, configure_index_refresh
+    from nutrimaster.web.admin.app import (
+        admin_bp,
+        configure_index_build_status,
+        configure_index_refresh,
+        configure_index_status,
+        configure_pipeline_execution_gate,
+    )
 
     services = app.state.services
 
-    def refresh_admin_index(data_dir: Path, force: bool = False) -> None:
-        """刷新管理后台索引的回调函数。"""
-        services.refresh_index(data_dir=data_dir, force=force)
+    def refresh_admin_index(data_dir: Path, force: bool = False) -> dict:
+        """Queue an isolated index build for the management console."""
+        return services.request_index_build(
+            data_dir=data_dir,
+            force=force,
+            reason="extraction-admin",
+        )
 
     flask_app = FlaskApp(__name__, static_folder=None)
     configure_index_refresh(refresh_admin_index)
+    configure_index_status(services.retriever.index_status)
+    configure_index_build_status(services.index_build_status)
+    configure_pipeline_execution_gate(services.experiment_service.execution_gate)
     flask_app.register_blueprint(admin_bp)
     app.mount("/admin", WSGIMiddleware(flask_app))
 
@@ -191,9 +197,14 @@ if __name__ == "__main__":
 
     runtime_settings = app.state.settings
     rag = runtime_settings.rag
+    # This module has already constructed ``app`` above. Reusing that object
+    # prevents ``python -m nutrimaster.web.app`` from importing the module a
+    # second time and constructing another corpus-sized service container.
+    # Use ``nutrimaster.cli web --reload`` for the development reloader.
     uvicorn.run(
-        "nutrimaster.web.app:app",
+        app,
         host=rag.web_host if rag else "0.0.0.0",
         port=rag.web_port if rag else 5000,
-        reload=rag.debug if rag else False,
+        reload=False,
+        workers=1,
     )

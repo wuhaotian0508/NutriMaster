@@ -32,6 +32,41 @@ TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 
 
+def _bounded_markdown_bytes() -> int:
+    """Return a fail-fast byte limit for one extraction input document."""
+
+    hard_max = 32 * 1024 * 1024
+    raw = os.getenv("NUTRIMASTER_EXTRACTION_MAX_MARKDOWN_BYTES", str(16 * 1024 * 1024))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "NUTRIMASTER_EXTRACTION_MAX_MARKDOWN_BYTES must be an integer"
+        ) from exc
+    if not 1 <= value <= hard_max:
+        raise RuntimeError(
+            "NUTRIMASTER_EXTRACTION_MAX_MARKDOWN_BYTES must be between 1 and 32 MiB"
+        )
+    return value
+
+
+MAX_MARKDOWN_BYTES = _bounded_markdown_bytes()
+
+
+def read_markdown_bounded(path: Path) -> str:
+    """Read one UTF-8 Markdown file without allocating an unbounded string."""
+
+    source = Path(path)
+    with source.open("rb") as file:
+        payload = file.read(MAX_MARKDOWN_BYTES + 1)
+    if len(payload) > MAX_MARKDOWN_BYTES:
+        raise ValueError(
+            f"Markdown file exceeds the {MAX_MARKDOWN_BYTES}-byte extraction limit: "
+            f"{source.name}"
+        )
+    return payload.decode("utf-8")
+
+
 _primary_client = None
 
 

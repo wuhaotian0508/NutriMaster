@@ -65,6 +65,8 @@ def test_question_evaluator_success():
     assert result["题目标题"] == "测试题"
     assert result["难度等级"] == "中等"
     assert result["领域大类"] == "植物营养"
+    assert result["评测状态"] == "scored"
+    assert result["运行ID"]
     assert judge.calls == [("问题正文", "答案", [{"描述": "采分点", "满分": 2.0}], "参考")]
 
 
@@ -80,6 +82,7 @@ def test_question_evaluator_agent_error_skips_judge():
     assert result["答案"] == ""
     assert result["评分详情"] == "Agent 失败: agent failed"
     assert result["error"] == "agent failed"
+    assert result["评测状态"] == "agent_error"
     assert judge.calls == []
 
 
@@ -95,3 +98,4 @@ def test_question_evaluator_judge_error_keeps_agent_answer():
     assert result["答案"] == "答案"
     assert result["评分详情"] == "Judge 失败: judge failed"
     assert result["error"] == "judge failed"
+    assert result["评测状态"] == "judge_error"

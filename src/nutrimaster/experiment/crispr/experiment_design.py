@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from nutrimaster.experiment.crispr.sop_formatter import format_sop_to_markdown
+from nutrimaster.experiment.resource_limits import SOPOutputBudget
 
 _KNOWN_ORGANISMS = {"Oryza", "Zea", "Nicotiana", "Triticum", "Glycine", "Arabidopsis"}
 
@@ -225,6 +226,7 @@ def run_experiment_design(
     target_by_species: dict[str, Path] = {f.stem.replace("_crispr_target", ""): f for f in target_files}
 
     sops: dict[str, str] = {}
+    sop_budget = SOPOutputBudget()
 
     for species_key, tsv_file in target_by_species.items():
         species_display = species_key.replace("_", " ")
@@ -247,6 +249,7 @@ def run_experiment_design(
         text = text.replace("_crispr_target_candidate_", tsv_full)
 
         markdown_text = format_sop_to_markdown(text)
+        sop_budget.consume(markdown_text, label=species_display)
 
         out_file = work_dir / f"{species_key}_SOP_CRISPR_SpCas9.md"
         out_file.write_text(markdown_text, encoding="utf-8")

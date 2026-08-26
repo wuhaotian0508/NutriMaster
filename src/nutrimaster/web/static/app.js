@@ -16,6 +16,7 @@ const I18N = {
         'input.placeholder': '描述你的需求，例如：如何通过基因编辑提高大豆类黄酮含量',
         'input.personal': '个人库',
         'input.depth': '深度搜索',
+        'input.piRuntime': 'Pi 工具模式（默认）',
         // 场景
         'scene.eyebrow': '科研场景',
         'scene.category': '场景介绍',
@@ -109,6 +110,7 @@ const I18N = {
         // 搜索进度
         'search.searching': '正在搜索...',
         'search.deepSearching': '深度搜索中，正在检索更多文献并生成综合报告...',
+        'search.piChat': 'Pi 正在生成回答...',
         // 来源
         'source.title': '📚 参考来源',
         'source.gene_db': '基因库',
@@ -181,6 +183,7 @@ const I18N = {
         'input.placeholder': 'Describe your needs, e.g.: How to increase soybean flavonoid content via gene editing',
         'input.personal': 'Personal',
         'input.depth': 'Deep Research',
+        'input.piRuntime': 'Pi Tool Mode (default)',
         'scene.eyebrow': 'Research Modes',
         'scene.category': 'Research Scenarios',
         'scene.subtitle': 'Build a smarter entry point for plant nutrient metabolism research around literature evidence, regulatory networks, and your own curated knowledge.',
@@ -268,6 +271,7 @@ const I18N = {
         'thinking.done': 'Thinking process',
         'search.searching': 'Searching...',
         'search.deepSearching': 'Deep search: retrieving more literature and generating a comprehensive report...',
+        'search.piChat': 'Pi is generating a response...',
         'source.title': '📚 References',
         'source.gene_db': 'Gene DB',
         'source.pubmed': 'PubMed',
@@ -369,6 +373,12 @@ let currentSessionId = null;   // 当前对话的 session ID
 let hasStartedConversation = false;
 let isDeepSearch = false;
 let usePersonal = false;
+// Pi is the canonical chat runtime.  Use a new preference key so browsers
+// carrying the old legacy `usePiRuntime=false` value are migrated to Pi on
+// their next load.  An explicit false value remains a short-lived rollback
+// switch after the user chooses it in the current UI.
+const PI_RUNTIME_PREFERENCE_KEY = 'nutrimasterPiRuntimePreference';
+let usePiRuntime = localStorage.getItem(PI_RUNTIME_PREFERENCE_KEY) !== 'false';
 const assistantTurnState = new Map();
 let currentAbortController = null;  // 用于中断正在进行的 SSE 流
 let currentStreamMsgId = null;      // 正在流式生成的 assistant 消息 ID
@@ -469,7 +479,7 @@ function setSendBtnToSend() {
 }
 
 // 初始化
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     try {
         loadHistory();
         setupEventListeners();
@@ -480,7 +490,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // ===== 登录功能初始化 =====
         setupAuthListeners();
-        initAuth();
+        await initAuth();
     } catch (err) {
         console.error('前端初始化失败:', err);
         if (typeof showLoginOverlay === 'function') {
@@ -554,6 +564,16 @@ function setupEventListeners() {
         });
     }
 
+    const piRuntimeBtn = document.getElementById('pi-runtime-btn');
+    if (piRuntimeBtn) {
+        piRuntimeBtn.addEventListener('click', () => {
+            usePiRuntime = !usePiRuntime;
+            localStorage.setItem(PI_RUNTIME_PREFERENCE_KEY, String(usePiRuntime));
+            updateAgentModeUI();
+        });
+    }
+    updateAgentModeUI();
+
     // 语言切换按钮
     const langBtn = document.getElementById('lang-btn');
     if (langBtn) {
@@ -566,6 +586,14 @@ function setupEventListeners() {
         menuBtn.addEventListener('click', () => {
             document.querySelector('.sidebar').classList.toggle('collapsed');
         });
+    }
+}
+
+function updateAgentModeUI() {
+    const piRuntimeBtn = document.getElementById('pi-runtime-btn');
+    if (piRuntimeBtn) {
+        piRuntimeBtn.classList.toggle('active', usePiRuntime);
+        piRuntimeBtn.setAttribute('aria-pressed', String(usePiRuntime));
     }
 }
 
@@ -805,7 +833,9 @@ async function handleSend() {
     setSendBtnToStop();
     userHasScrolled = false; // 新查询开始时重置滚动状态
 
-    const loadingText = isDeepSearch ? t('search.deepSearching') : t('search.searching');
+    const loadingText = usePiRuntime
+        ? t('search.piChat')
+        : (isDeepSearch ? t('search.deepSearching') : t('search.searching'));
     const loadingHtml = `<div class="search-progress"><span class="search-spinner"></span>${escapeHtml(loadingText)}</div>`;
     const assistantMsgId = addMessage('assistant', loadingHtml);
     assistantTurnState.set(assistantMsgId, {
@@ -894,13 +924,18 @@ async function streamQuery(query, messageId) {
     const abortController = new AbortController();
     currentAbortController = abortController;
     currentStreamMsgId = messageId;
-    const response = await fetch('/api/query', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + getAccessToken(),
-        },
-        body: JSON.stringify({
+    const endpoint = usePiRuntime ? '/api/pi/query' : '/api/query';
+    const payload = usePiRuntime
+        ? {
+            query,
+            history,
+            use_personal: usePersonal,
+            use_depth: isDeepSearch,
+            session_id: currentSessionId || '',
+            client_turn_id: messageId,
+            capture_consent: true,
+        }
+        : {
             query,
             use_personal: usePersonal,
             use_depth: isDeepSearch,
@@ -911,7 +946,14 @@ async function streamQuery(query, messageId) {
             session_id: currentSessionId || '',
             client_turn_id: messageId,
             capture_consent: true,
-        }),
+        };
+    const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + getAccessToken(),
+        },
+        body: JSON.stringify(payload),
         signal: abortController.signal,
     });
 

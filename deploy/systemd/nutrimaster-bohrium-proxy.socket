@@ -1,0 +1,13 @@
+[Unit]
+Description=NutriMaster Bohrium compatibility ingress socket
+After=nutrimaster-unified.service
+PartOf=nutrimaster-unified.service
+
+[Socket]
+ListenStream=172.17.4.12:5000
+NoDelay=true
+Accept=no
+Service=nutrimaster-bohrium-proxy.service
+
+[Install]
+WantedBy=multi-user.target

@@ -34,6 +34,7 @@ data/interactions/
 # Backup directories
 data/backup_*/
 data/index-backup-*/
+data/index_sources/
 /data-backup/
 
 # Logs

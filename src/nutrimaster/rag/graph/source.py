@@ -4,10 +4,17 @@ from pathlib import Path
 from typing import Any
 
 from nutrimaster.rag.evidence import EvidenceItem
-from nutrimaster.rag.graph.extract import extract_graph_query, infer_direction as _infer_direction, infer_hops as _infer_hops
+from nutrimaster.rag.graph.extract import GraphQuery, extract_graph_query, infer_direction as _infer_direction, infer_hops as _infer_hops
 from nutrimaster.rag.graph.index import GraphSearchResult, LocalGraphIndex
 from nutrimaster.rag.graph.neo4j_store import Neo4jGraphConfig, Neo4jGraphStore
-from nutrimaster.rag.graph.path_search import GraphPathSearchResult, Neo4jPathSearcher
+from nutrimaster.rag.graph.path_search import (
+    GraphPath,
+    GraphPathNode,
+    GraphPathRelationship,
+    GraphPathSearchResult,
+    Neo4jPathSearcher,
+)
+from nutrimaster.rag.graph.resolver import ResolvedNode
 
 
 def infer_direction(query: str) -> str:
@@ -70,14 +77,7 @@ class GraphDbSource:
                 title=f"Graph neighborhood: {query}",
                 content=self._render(query, graph),
                 score=1.0,
-                metadata={
-                    "backend": "sqlite",
-                    "seeds": graph.seeds,
-                    "nodes": graph.nodes,
-                    "edges": graph.edges,
-                    "direction": direction,
-                    "hops": hops,
-                },
+                metadata={"backend": "sqlite", **_sqlite_graph_to_path_result(graph_query, graph).to_dict()},
             )
         ]
 
@@ -240,6 +240,54 @@ def _neo4j_title(result: GraphPathSearchResult) -> str:
     if starts and targets:
         return f"Graph path: {starts} -> {targets}"
     return f"Graph neighborhood: {result.graph_query.raw_query}"
+
+
+def _sqlite_graph_to_path_result(graph_query: GraphQuery, graph: GraphSearchResult) -> GraphPathSearchResult:
+    """把 SQLite 邻域结果转换成与 Neo4j 一致的路径结果对象。"""
+    nodes = {node["id"]: node for node in graph.nodes}
+    starts = tuple(
+        ResolvedNode(
+            id=str(seed.get("id") or ""),
+            name=str(seed.get("name") or ""),
+            type=str(seed.get("type") or ""),
+            species=str(seed.get("species") or ""),
+            labels=(str(seed.get("type") or ""),) if seed.get("type") else (),
+            score=1.0,
+            source="sqlite",
+        )
+        for seed in graph.seeds
+    )
+    paths: list[GraphPath] = []
+    for edge in graph.edges:
+        src = nodes.get(edge.get("src"), {"id": edge.get("src", "")})
+        dst = nodes.get(edge.get("dst"), {"id": edge.get("dst", "")})
+        relationship = GraphPathRelationship(
+            id=str(edge.get("id") or ""),
+            source_id=str(edge.get("src") or ""),
+            target_id=str(edge.get("dst") or ""),
+            type=str(edge.get("relation") or ""),
+            evidence=dict(edge.get("evidence") or {}),
+        )
+        paths.append(
+            GraphPath(
+                nodes=(_path_node_from_mapping(src), _path_node_from_mapping(dst)),
+                relationships=(relationship,),
+                score=1.0,
+                search_kind=graph_query.direction,
+            )
+        )
+    return GraphPathSearchResult(graph_query=graph_query, starts=starts, targets=(), paths=tuple(paths))
+
+
+def _path_node_from_mapping(node: dict[str, Any]) -> GraphPathNode:
+    node_type = str(node.get("type") or "")
+    return GraphPathNode(
+        id=str(node.get("id") or ""),
+        name=str(node.get("name") or node.get("id") or ""),
+        type=node_type,
+        species=str(node.get("species") or ""),
+        labels=(node_type,) if node_type else (),
+    )
 
 
 def _node_label(node: dict[str, Any]) -> str:

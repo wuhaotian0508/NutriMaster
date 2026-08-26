@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 from .config import (
     EXTRACTOR_MODEL, TEMPERATURE,
     PROMPT_PATH, SCHEMA_PATH, REPORTS_DIR,
-    get_openai_client,
+    get_openai_client, read_markdown_bounded,
 )
 from .text_utils import preprocess_md_for_llm
 from .token_tracker import TokenTracker
@@ -226,6 +226,10 @@ def _call_extract_api(
             tool_choice={"type": "function", "function": {"name": "extract_all_genes"}},
             **api_kwargs,
         )
+    except MemoryError:
+        # Allocator pressure is a process-health event, not an upstream API
+        # failure.  Let the batch boundary stop further work immediately.
+        raise
     except Exception as e:
         print(f"    ❌ [{model}] API error (extract_all): {e}")
         return None, None, False
@@ -310,8 +314,7 @@ def extract_paper(
         return extraction, gene_dict
 
     # Read and preprocess
-    with open(md_path, "r", encoding="utf-8") as f:
-        content = f.read()
+    content = read_markdown_bounded(md_path)
 
     original_len = len(content)
     content = preprocess_md_for_llm(content, tracker=tracker)

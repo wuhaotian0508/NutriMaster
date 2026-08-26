@@ -7,7 +7,7 @@ NutriMaster 是一个面向植物营养与代谢基因知识库的抽取、检�
 - 从论文 Markdown 中抽取结构化植物营养/代谢基因信息。
 - 使用 LLM 对抽取字段进行原文依据验证和纠错。
 - 将已验证论文保存为 `*_nutri_plant_verified.json` 主语料。
-- 对主语料进行分块、向量化和增量索引。
+- 对主语料构建不可变索引 generation，同时提供 dense、BM25、字段关键词和 Graph RAG 检索。
 - 提供 FastAPI Web 应用，用于 RAG 问答、技能调用、SOP 生成和个人知识库。
 - 提供 Admin 管理界面，用于上传论文、运行抽取流水线、编辑 prompt/schema 和重建索引。
 - 自动化测试直接覆盖主 Web 应用接口，避免维护第二套 API 入口。
@@ -77,6 +77,7 @@ NutriMaster 是一个面向植物营养与代谢基因知识库的抽取、检�
 ## 环境要求
 
 - Python `>=3.11`
+- Node.js `>=22.19`（本地 Pi Runtime）
 - OpenAI-compatible LLM endpoint，用于抽取、验证和对话
 - Jina API key，用于 embedding 和检索
 - Supabase 项目，用于认证和用户资料
@@ -89,9 +90,20 @@ NutriMaster 是一个面向植物营养与代谢基因知识库的抽取、检�
 
 ```bash
 uv sync --dev
+npm --prefix pi-runtime ci
 ```
 
-如果只想一键启动，`uv run` 会自动创建环境并同步依赖：
+依赖安装完成后，可以一键启动完整的本地 Web + Pi 栈：
+
+```bash
+./start-local.sh
+```
+
+`start-local.sh` 会启动本地 Pi Node sidecar（`127.0.0.1:8787`）和
+FastAPI Web（默认 `127.0.0.1:5000`），并在 Pi 未通过 `/healthz` 前不启动
+Web。新会话默认使用 `/api/pi/query`；旧 `/api/query` 仅作为临时回滚入口。
+
+如果只需要启动 Python Web 进程（不会提供 Pi 问答链路），可以单独运行：
 
 ```bash
 uv run nutrimaster web
@@ -113,8 +125,13 @@ LLM 配置：
 OPENAI_API_KEY=...
 OPENAI_BASE_URL=...
 MAIN_MODEL=deepseek-v4-flash
+EXPERIMENT_MODEL=gemini-2.5-flash
 EXTRACTOR_MODEL=gpt-5.5
 ```
+
+`EXPERIMENT_MODEL` 用于 CRISPR/转基因预览中的基因和受体物种提取；未配置时
+默认沿用 `MAIN_MODEL`。如果网关没有提供 `MAIN_MODEL`，请将它设置为网关中
+实际可用的模型，避免实验预览返回 503。
 
 检索配置：
 
@@ -140,7 +157,6 @@ SITE_URL=http://localhost:5000
 ```bash
 WEB_HOST=0.0.0.0
 WEB_PORT=5000
-ADMIN_PORT=5501
 DEBUG=false
 TOP_K_RETRIEVAL=20
 TOP_K_RERANK=10
@@ -199,36 +215,54 @@ uv run nutrimaster web
 - Web 应用：`http://localhost:5000`
 - Admin 面板：`http://localhost:5000/admin`
 
+生产拓扑固定为一个监听 `127.0.0.1:5000` 的单 worker FastAPI
+进程，它同时承载 `/api/query`、`/api/pi/query`、Admin、认证、
+个人库和实验路由。Pi 只是监听 `127.0.0.1:8787` 的 Node 编排 sidecar，
+不加载 Python 索引。启动正式 unified 前必须停止并禁用已确认归属的旧
+`5000`/`5002` 进程；`5002` 不得与正式服务并行常驻或作为第二个生产
+Python 服务。
+
 ### SQLite 图 RAG 可视化
 
-网页会在回答下方展示 SQLite 图 RAG 返回的节点和关系证据。先在本地构建图索引：
+网页会在回答下方展示 SQLite 图 RAG 返回的节点和关系证据。
+下面命令仅用于本地图索引开发；生产必须由 isolated builder 在完整
+generation 中一次性构建 dense、BM25、字段关键词和 Graph：
 
 ```bash
 python3 -m nutrimaster.rag.graph.cli --backend sqlite --corpus data/corpus --out data/index/graph_index.sqlite
 export NUTRIMASTER_GRAPH_BACKEND=sqlite
 ```
 
-启动 Web 后，`rag_search` 命中 `source_type=graph_db` 时会通过 SSE 推送 `graph_evidence`，前端使用本地 `/static/vendor/vis-network/` 资源渲染图谱证据卡片。没有 `data/index/graph_index.sqlite` 时，普通 PubMed/GeneDB RAG 仍会正常工作，只是不显示图谱卡片。
+启动 Web 后，`rag_search` 命中 `source_type=graph_db` 时会通过 SSE 推送 `graph_evidence`，前端使用本地 `/static/vendor/vis-network/` 资源渲染图谱证据卡片。本地开发时缺少 `data/index/graph_index.sqlite` 只会影响图谱证据；生产不允许这种降级，启动校验要求 Graph 产物和其他三种检索产物全部完整。
 
 根目录 `graph/` 是历史空目录，可删除；`graphing/` 是旧静态可视化目录，`vis-network` 已迁移到 Web 静态目录后也可清理。
 
-生产或部署环境可直接使用 Uvicorn：
+生产环境安装 `deploy/systemd/` 中的 slice、unified、Pi 和 builder
+units。必须先确认 `CURRENT` 指向已校验的完整 generation，再启动
+Pi 和统一 Web：
 
 ```bash
-uv run uvicorn nutrimaster.web.app:app --host 0.0.0.0 --port 5000
+.venv/bin/python -m nutrimaster.rag.index_builder_cli verify-active
+systemctl enable --now nutrimaster-index-builder.path nutrimaster-pi.service
+# 先停止并禁用已确认归属的旧 5000/5002，确认两个端口均关闭
+systemctl enable --now nutrimaster-unified.service
 ```
+
+新索引只能通过 Admin 提交 durable job，由受内存限制的
+`nutrimaster-index-builder.service` 串行构建、验证、原子切换和失败回滚。
+禁止 Web 在启动时、在线请求中或每篇论文后直接建索引，也不得用
+cron 直接调用旧重建脚本。详见
+[`docs/index_builder_operations.md`](docs/index_builder_operations.md) 和
+[`docs/pi_runtime_migration.md`](docs/pi_runtime_migration.md)。
 
 ## Admin
 
-Admin 挂载在主 Web 应用的 `/admin` 路径下，不再维护独立 Flask 启动命令。功能包括上传论文 ZIP、去重、单篇预览、批量抽取与验证、SSE 进度、prompt/schema 编辑、索引重建和已处理论文列表。Admin 访问由 `ADMIN_EMAIL` 白名单控制。
+Admin 挂载在主 Web 应用的 `/admin` 路径下，不再维护独立 Flask 启动命令。功能包括上传论文 ZIP、去重、单篇预览、批量抽取与验证、SSE 进度、prompt/schema 编辑、索引重建排队和已处理论文列表。Admin 访问由 `ADMIN_EMAIL` 白名单控制。
 
-如果希望启动时自动构建索引，设置：
-
-```bash
-NUTRIMASTER_API_BUILD_INDEX=true
-```
-
-注意：启动时建索引会增加启动时间和外部 API 调用成本。
+生产 Admin Pipeline 严格串行：同时只允许一个 Pipeline，且
+`NUTRIMASTER_PIPELINE_DEFAULT_WORKERS=1` 和
+`NUTRIMASTER_PIPELINE_MAX_WORKERS=1`。单篇预览或 Pipeline 完成后只排队，
+不在 Web 进程中构建。
 
 ## 运行 Extractor 流水线
 
@@ -269,15 +303,24 @@ uv run nutrimaster extract --rerun
 - `src/nutrimaster/rag/index_service.py`
 - `src/nutrimaster/rag/jina_retriever.py`
 
-索引器扫描 `RAG_DATA_DIR` 下的 `*_nutri_plant_verified.json`，生成结构化 gene chunks，调用 Jina embedding，并写入：
+索引器扫描 `RAG_DATA_DIR` 下的 `*_nutri_plant_verified.json`，生成结构化 gene chunks，调用 Jina embedding，并将完整产物写入新的不可变 generation：
 
 ```text
-data/index/manifest.json
-data/index/chunks.pkl
-data/index/embeddings.npy
+data/index/
+├── CURRENT
+└── generations/<generation-id>/
+    ├── manifest.json
+    ├── chunks.pkl
+    ├── embeddings.npy
+    ├── embedding_norms.npy
+    ├── bm25_sparse_v4.pkl
+    ├── field_keyword_v3.sqlite3
+    └── graph_index.sqlite
 ```
 
-`manifest.json` 记录文件 hash 和 chunk range，用于增量重建时复用未变化文件。
+`CURRENT` 只在新 generation 的 hash、shape、corpus fingerprint 和 SQLite
+完整性全部通过后原子切换。生产同时保护当前和上一代回滚 generation；
+不得为强行通过磁盘预检而删除其中任意一代。
 
 ## 个人文献库
 
@@ -478,7 +521,7 @@ DEVELOPMENT.md
 6. 启动 Web：
 
    ```bash
-   uv run nutrimaster web
+   ./start-local.sh
    ```
 
 7. 打开：

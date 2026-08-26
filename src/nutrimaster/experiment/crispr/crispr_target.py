@@ -310,6 +310,8 @@ def run_crispr_target(fasta_files: list[Path], work_dir: Path) -> list[Path]:
             species, gene, accession = _parse_fasta_header(seq_name)
             try:
                 all_rows = _extract_rows(_fetch_result_page(sequence, species))
+            except MemoryError:
+                raise
             except Exception as exc:
                 logger.warning("CRISPR target design failed for %s: %s", seq_name, exc)
                 continue

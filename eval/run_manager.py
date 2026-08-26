@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
+from eval.metrics.stats import is_failed_result
+
 try:
     from tqdm.asyncio import tqdm
     HAS_TQDM = True
@@ -225,7 +227,7 @@ class RunManager:
         total = len(completed)
         failed = sum(
             1 for r in completed.values()
-            if r.get("error") or r.get("总分", 0) == 0
+            if is_failed_result(r)
         )
         success = total - failed
 
@@ -269,8 +271,8 @@ class RunManager:
             # 重跑失败的题目
             if retry_failed:
                 result = completed[q_id]
-                # 判断失败：有 error 或总分为 0
-                if result.get("error") or result.get("总分", 0) == 0:
+                # 只重跑评测链路失败；正常得到的 0 分也是有效结果。
+                if is_failed_result(result):
                     remaining.append(q)
 
         return remaining
@@ -338,6 +340,7 @@ class RunManager:
                         "答案": "",
                         "总分": 0.0,
                         "满分": sum(r.get("满分", 0) for r in q.get("采分点", [])),
+                        "评测状态": "runner_error",
                         "error": str(e),
                     }
 

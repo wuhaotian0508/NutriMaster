@@ -201,10 +201,12 @@ class LlmSettings:
         api_key: API 密钥。
         base_url: API 基础 URL。
         model: 使用的模型名称。
+        experiment_model: 实验预览使用的模型名称，默认沿用主模型。
     """
     api_key: str = ""
     base_url: str = ""
     model: str = ""
+    experiment_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -253,6 +255,7 @@ class Settings:
         openai_api_key: OpenAI 兼容 API 密钥。
         openai_base_url: OpenAI 兼容 API 基础 URL。
         model: 主要使用的 LLM 模型名称。
+        experiment_model: CRISPR/转基因实验提取使用的 LLM 模型名称。
         jina_api_key: Jina API 密钥（用于嵌入和重排序）。
         supabase_url: Supabase 项目 URL。
         supabase_service_role_key: Supabase 服务角色密钥。
@@ -273,6 +276,7 @@ class Settings:
     openai_api_key: str = ""
     openai_base_url: str = ""
     model: str = ""
+    experiment_model: str = ""
     jina_api_key: str = ""
     supabase_url: str = ""
     supabase_service_role_key: str = ""
@@ -314,6 +318,10 @@ class Settings:
             api_key=source.get("OPENAI_API_KEY", ""),
             base_url=source.get("OPENAI_BASE_URL", ""),
             model=source.get("MAIN_MODEL", ""),
+            experiment_model=(
+                source.get("EXPERIMENT_MODEL", "")
+                or source.get("MAIN_MODEL", "")
+            ),
         )
         auth = AuthSettings(
             supabase_url=source.get("SUPABASE_URL", ""),
@@ -333,6 +341,7 @@ class Settings:
             openai_api_key=llm.api_key,
             openai_base_url=llm.base_url,
             model=llm.model,
+            experiment_model=llm.experiment_model,
             jina_api_key=source.get("JINA_API_KEY", ""),
             supabase_url=auth.supabase_url,
             supabase_service_role_key=auth.supabase_service_role_key,

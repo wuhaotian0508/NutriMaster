@@ -199,3 +199,42 @@ def test_incremental_indexer_removes_stale_embeddings_for_empty_corpus(tmp_path:
     assert chunks == []
     assert embeddings is None
     assert not (index_dir / "embeddings.npy").exists()
+
+
+def test_incremental_indexer_streams_embedding_parts_without_concatenate(
+    tmp_path: Path,
+    monkeypatch,
+):
+    data_dir = tmp_path / "data"
+    index_dir = tmp_path / "index"
+    data_dir.mkdir()
+    index_dir.mkdir()
+    (data_dir / "first.json").write_text("{}", encoding="utf-8")
+    (data_dir / "second.json").write_text("{}", encoding="utf-8")
+
+    indexer = IncrementalIndexer(
+        index_dir,
+        data_dir,
+        lambda texts: np.ones((len(texts), 3), dtype=np.float32),
+    )
+
+    def forbidden_concatenate(*args, **kwargs):
+        raise AssertionError("dense index assembly must not allocate np.concatenate")
+
+    monkeypatch.setattr(np, "concatenate", forbidden_concatenate)
+    chunks, embeddings = indexer.build_incremental(
+        load_paper_fn=lambda path: [_sample_chunk()],
+    )
+
+    assert len(chunks) == 2
+    assert isinstance(embeddings, np.memmap)
+    np.testing.assert_array_equal(embeddings, np.ones((2, 3), dtype=np.float32))
+
+    # The unchanged incremental pass must also keep the old dense matrix
+    # file-backed while it copies per-file slices into the atomic temporary.
+    chunks, embeddings = indexer.build_incremental(
+        load_paper_fn=lambda path: (_ for _ in ()).throw(AssertionError("unexpected rebuild")),
+    )
+    assert len(chunks) == 2
+    assert isinstance(embeddings, np.memmap)
+    np.testing.assert_array_equal(embeddings, np.ones((2, 3), dtype=np.float32))

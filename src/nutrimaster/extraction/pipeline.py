@@ -16,7 +16,7 @@ pipeline.py — 论文级并行处理的编排器。
 
 import argparse
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -32,7 +32,8 @@ from .token_tracker import TokenTracker
 
 
 def collect_paper_result(filename: str, result: dict, all_reports: list,
-                         failed_files: list, skipped_files: list):
+                         failed_files: list, skipped_files: list,
+                         *, retain_report: bool = True):
     """把单篇论文的处理结果分桶收集。
 
     根据 result 中的 status 字段，将结果分类到三个列表中：
@@ -50,7 +51,7 @@ def collect_paper_result(filename: str, result: dict, all_reports: list,
     status = result.get("status", "failed")
     if status == "processed":
         report = result.get("report")
-        if report:
+        if report and retain_report:
             all_reports.append(report)
     elif status == "skipped":
         skipped_files.append(filename)
@@ -148,6 +149,10 @@ def process_one_paper(md_path: Path, stem: str, tracker: TokenTracker):
             return report
         return {"status": "processed", "report": report}
 
+    except MemoryError:
+        # Never downgrade allocator exhaustion to one failed paper and then
+        # continue allocating for the rest of the corpus.
+        raise
     except Exception as e:
         print(f"  ❌ Error processing {stem}: {e}")
         import traceback
@@ -227,6 +232,7 @@ def run_pipeline_batch(
     stop_requested: Optional[Callable[[], bool]] = None,
     on_paper_start: Optional[Callable[[str, int, int, bool], None]] = None,
     on_paper_done: Optional[Callable[[str, dict, int, int, bool], None]] = None,
+    retain_reports: bool = True,
 ) -> dict:
     """执行一批论文的提取管线编排（CLI 和 Admin 共用核心）。
 
@@ -248,6 +254,8 @@ def run_pipeline_batch(
         stop_requested: 可选的停止检查回调，返回 True 时提前终止
         on_paper_start: 论文开始处理时的回调
         on_paper_done: 论文处理完成时的回调
+        retain_reports: 是否在内存中保留所有完整报告。Admin 进程应关闭；
+            CLI 默认保留以生成汇总。
 
     Returns:
         dict: 包含以下键的结果字典：
@@ -283,7 +291,14 @@ def run_pipeline_batch(
             md_path = input_dir / filename
             stem = Path(filename).stem
             result = process_one_paper(md_path, stem, tracker)
-            collect_paper_result(filename, result, all_reports, failed_files, skipped_files)
+            collect_paper_result(
+                filename,
+                result,
+                all_reports,
+                failed_files,
+                skipped_files,
+                retain_report=retain_reports,
+            )
 
             done_count = i + 1
             if on_paper_done:
@@ -291,11 +306,20 @@ def run_pipeline_batch(
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             future_to_file = {}
+            remaining_files = iter(files)
 
-            for filename in files:
+            def submit_next() -> bool:
+                """Keep at most ``workers`` papers in flight at any time."""
+
+                nonlocal stopped, submitted
                 if stop_requested and stop_requested():
                     stopped = True
-                    break
+                    return False
+
+                try:
+                    filename = next(remaining_files)
+                except StopIteration:
+                    return False
 
                 if on_paper_start:
                     on_paper_start(filename, submitted, total, True)
@@ -305,20 +329,53 @@ def run_pipeline_batch(
                 future = pool.submit(process_one_paper, md_path, stem, tracker)
                 future_to_file[future] = filename
                 submitted += 1
+                return True
 
-            for future in as_completed(future_to_file):
-                filename = future_to_file[future]
+            for _ in range(min(workers, total)):
+                if not submit_next():
+                    break
+
+            while future_to_file:
+                completed, _pending = wait(
+                    tuple(future_to_file),
+                    return_when=FIRST_COMPLETED,
+                )
+                completed_results = []
                 try:
-                    result = future.result()
-                except Exception as e:
-                    print(f"  ❌ {filename}: {e}")
-                    result = {"status": "failed", "report": None}
+                    for future in completed:
+                        filename = future_to_file.pop(future)
+                        try:
+                            result = future.result()
+                        except MemoryError:
+                            # Do not submit replacement work after any worker
+                            # reports allocator pressure.
+                            raise
+                        except Exception as e:
+                            print(f"  ❌ {filename}: {e}")
+                            result = {"status": "failed", "report": None}
+                        completed_results.append((filename, result))
+                except MemoryError:
+                    for pending in future_to_file:
+                        pending.cancel()
+                    raise
 
-                collect_paper_result(filename, result, all_reports, failed_files, skipped_files)
+                for filename, result in completed_results:
+                    collect_paper_result(
+                        filename,
+                        result,
+                        all_reports,
+                        failed_files,
+                        skipped_files,
+                        retain_report=retain_reports,
+                    )
 
-                done_count += 1
-                if on_paper_done:
-                    on_paper_done(filename, result, done_count, total, True)
+                    done_count += 1
+                    if on_paper_done:
+                        on_paper_done(filename, result, done_count, total, True)
+
+                for _ in completed_results:
+                    if not submit_next():
+                        break
 
     return {
         "tracker": tracker,

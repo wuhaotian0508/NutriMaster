@@ -289,7 +289,13 @@ async def call_llm_stream(*args, **kwargs):
         yield chunk
 
 
-def call_llm_sync(messages, is_agent_call: bool = False, **kwargs):
+def call_llm_sync(
+    messages,
+    is_agent_call: bool = False,
+    *,
+    model: str | None = None,
+    **kwargs,
+):
     """同步调用 LLM 的便捷函数。
 
     使用全局默认同步客户端发送请求。首次调用时自动创建客户端并缓存。
@@ -297,6 +303,7 @@ def call_llm_sync(messages, is_agent_call: bool = False, **kwargs):
     Args:
         messages: 聊天消息列表，符合 OpenAI 消息格式。
         is_agent_call: 是否为 Agent 调用，影响 DeepSeek 模型的推理力度设置。
+        model: 可选的模型覆盖；未传入时使用 MAIN_MODEL。
         **kwargs: 其他传递给 chat.completions.create 的参数。
 
     Returns:
@@ -306,7 +313,12 @@ def call_llm_sync(messages, is_agent_call: bool = False, **kwargs):
     settings = Settings.from_env()
     if _DEFAULT_SYNC_CLIENT is None:
         _DEFAULT_SYNC_CLIENT = create_sync_client(settings)
-    params = {"model": settings.model, "messages": messages, **kwargs}
-    params = sanitize_params_for_model(settings.model, params, is_agent_call=is_agent_call)
+    selected_model = model or settings.model
+    params = {"model": selected_model, "messages": messages, **kwargs}
+    params = sanitize_params_for_model(
+        selected_model,
+        params,
+        is_agent_call=is_agent_call,
+    )
     response = _DEFAULT_SYNC_CLIENT.chat.completions.create(**params)
     return response.choices[0].message

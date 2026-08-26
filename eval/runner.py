@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
+import re
+import subprocess
 import time
+import uuid
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from eval.agent_factory import iter_agents
@@ -14,6 +21,63 @@ from eval.datamanager import save_local_results
 from eval.judge.llm_judge import LLMJudge
 from eval.metrics.stats import calc_stats, print_stats
 from eval.run_manager import RunManager
+
+
+_GENERATION_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@lru_cache(maxsize=1)
+def _repository_metadata() -> dict[str, str]:
+    """Capture code and index identities once for reproducible result rows."""
+    root = Path(__file__).resolve().parents[1]
+    metadata: dict[str, str] = {}
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        revision = completed.stdout.strip()
+        if revision:
+            metadata["代码提交"] = revision
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        metadata["工作区状态"] = "dirty" if status.stdout.strip() else "clean"
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    current_path = root / "data" / "index" / "CURRENT"
+    try:
+        generation_id = current_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        generation_id = ""
+    if _GENERATION_ID_RE.fullmatch(generation_id):
+        metadata["索引代次"] = generation_id
+    return metadata
+
+
+def _new_run_metadata() -> dict[str, str]:
+    run_id = os.getenv("EVAL_RUN_ID") or (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{uuid.uuid4().hex[:8]}"
+    )
+    return {"运行ID": run_id, **_repository_metadata()}
+
+
+def _agent_model(agent: EvalAgent) -> str:
+    for attribute in ("model_id", "model"):
+        value = getattr(agent, attribute, None)
+        if value:
+            return str(value)
+    return ""
 
 
 def _question_result_metadata(question: dict[str, Any]) -> dict[str, Any]:
@@ -58,11 +122,16 @@ class QuestionEvaluator:
         self.judge = judge
         self.version = version
         self.judge_sem = judge_sem
+        self.run_metadata = _new_run_metadata()
 
     async def evaluate(self, question: dict[str, Any], agent: EvalAgent) -> dict[str, Any]:
         q_id = question.get("编号", 0)
         q_text = question.get("正文", "")
         rubrics = question.get("采分点", [])
+        result_metadata = {**_question_result_metadata(question), **self.run_metadata}
+        agent_model = _agent_model(agent)
+        if agent_model:
+            result_metadata["被测模型"] = agent_model
 
         print(f"  … 题目 {q_id} - Agent 开始回答", flush=True)
         start = time.time()
@@ -73,7 +142,7 @@ class QuestionEvaluator:
         if agent_error:
             print(f"  ✗ 题目 {q_id} - Agent 失败: {agent_error}", flush=True)
             return {
-                **_question_result_metadata(question),
+                **result_metadata,
                 "题目编号": q_id,
                 "Agent名称": agent.name,
                 "版本": self.version,
@@ -82,6 +151,7 @@ class QuestionEvaluator:
                 "满分": sum(r.get("满分", 0) for r in rubrics),
                 "评分详情": f"Agent 失败: {agent_error}",
                 "耗时": duration,
+                "评测状态": "agent_error",
                 "error": agent_error,
             }
 
@@ -98,7 +168,7 @@ class QuestionEvaluator:
         if judge_result.get("ok"):
             print(f"  ✓ 题目 {q_id} - Judge 评分: {judge_result['总分']:.2f}/{judge_result['满分']:.2f}", flush=True)
             return {
-                **_question_result_metadata(question),
+                **result_metadata,
                 **_rubric_score_props(judge_result),
                 "题目编号": q_id,
                 "Agent名称": agent.name,
@@ -108,12 +178,13 @@ class QuestionEvaluator:
                 "满分": judge_result["满分"],
                 "评分详情": judge_result["评分详情"],
                 "耗时": duration,
+                "评测状态": "scored",
             }
 
         judge_error = judge_result.get("error") or "未知错误"
         print(f"  ✗ 题目 {q_id} - Judge 失败: {judge_error}", flush=True)
         return {
-            **_question_result_metadata(question),
+            **result_metadata,
             "题目编号": q_id,
             "Agent名称": agent.name,
             "版本": self.version,
@@ -122,6 +193,7 @@ class QuestionEvaluator:
             "满分": sum(r.get("满分", 0) for r in rubrics),
             "评分详情": f"Judge 失败: {judge_error}",
             "耗时": duration,
+            "评测状态": "judge_error",
             "error": judge_error,
         }
 

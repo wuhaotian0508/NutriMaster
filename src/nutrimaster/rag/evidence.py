@@ -307,8 +307,8 @@ def extract_graph_evidence(
     """从 EvidencePacket 中提取可公开展示的图 RAG 执行证据。
 
     这里展示的是工具检索到的节点、边和边上证据，不包含模型隐藏推理。
-    SQLite 图源已经在 metadata 中提供 nodes/edges；Neo4j 图源则从 paths
-    里摊平成同样的结构，方便前端统一渲染。
+    图源优先在 metadata.paths 中提供 GraphPathSearchResult 形状；旧的 nodes/edges
+    metadata 仍作为兼容输入支持，前端统一渲染成局部图。
     """
     graphs: list[dict[str, Any]] = []
     for item in packet.items:

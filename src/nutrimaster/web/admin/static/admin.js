@@ -307,7 +307,21 @@ async function refreshIndexStatus() {
 
         // 更新状态徽章
         const statusBadge = document.getElementById('index-status');
-        if (data.is_synced) {
+        const build = data.build || {};
+        const activeBuildStates = new Set([
+            'queued', 'preflight', 'snapshotting', 'building', 'publishing', 'activating'
+        ]);
+        if (build.next_state === 'queued' || activeBuildStates.has(build.state)) {
+            const state = build.next_state === 'queued' ? 'queued' : build.state;
+            statusBadge.textContent = `⏳ Build ${state}`;
+            statusBadge.className = 'badge badge-info';
+        } else if (build.state === 'awaiting_activation') {
+            statusBadge.textContent = '⚠️ Awaiting activation';
+            statusBadge.className = 'badge badge-warning';
+        } else if (build.state === 'failed') {
+            statusBadge.textContent = '❌ Index build failed';
+            statusBadge.className = 'badge badge-error';
+        } else if (data.is_synced) {
             statusBadge.textContent = '✅ Synced';
             statusBadge.className = 'badge badge-success';
         } else {
@@ -332,7 +346,7 @@ async function rebuildIndex() {
 
     try {
         btn.disabled = true;
-        btn.textContent = '🔄 Rebuilding...';
+        btn.textContent = '📥 Queueing...';
 
         const resp = await fetch(ADMIN_BASE + '/api/index/rebuild', {
             method: 'POST',
@@ -345,7 +359,7 @@ async function rebuildIndex() {
         }
 
         const data = await resp.json();
-        alert(data.message || 'Index rebuild started in background');
+        alert(data.message || `Index build queued (${data.job_id})`);
 
         // 5秒后刷新状态
         setTimeout(() => refreshIndexStatus(), 5000);
@@ -608,15 +622,15 @@ function connectSSE() {
         );
     });
 
-    // 正在重建 RAG 索引
-    sseSource.addEventListener('rebuilding_index', () => {
-        addLogLine('🔄 Rebuilding RAG index...', 'info');
+    // 正在提交独立索引构建任务
+    sseSource.addEventListener('queueing_index', () => {
+        addLogLine('📥 Queueing isolated RAG index build...', 'info');
     });
 
-    // 索引重建成功
-    sseSource.addEventListener('index_rebuilt', () => {
-        addLogLine('✅ RAG index rebuilt successfully', 'success');
-        // 刷新索引状态显示
+    // 任务已持久化排队；这不代表新代已经构建或激活
+    sseSource.addEventListener('index_queued', (e) => {
+        const d = JSON.parse(e.data);
+        addLogLine(`📥 Index build queued: ${d.job_id}`, 'info');
         setTimeout(() => refreshIndexStatus(), 1000);
     });
 

@@ -21,6 +21,7 @@ from typing import Any
 
 from eval.configs import NOTION_API_KEY
 from eval.datamanager.local_storage import LocalStorage
+from eval.metrics.stats import calc_stats
 
 
 def filter_results(
@@ -167,30 +168,6 @@ def calc_filtered_stats(
     if dedupe_latest:
         filtered = dedupe_latest_by_question(filtered)
 
-    if not filtered:
-        return {
-            "过滤条件": {
-                "Agent名称": agent_name,
-                "版本": version,
-                "时间范围": f"{after or '开始'} ~ {before or '结束'}",
-                "题目编号范围": f"{question_id_min or '开始'} ~ {question_id_max or '结束'}",
-                "去重": dedupe_latest,
-            },
-            "题目数": 0,
-            "总得分": 0.0,
-            "总满分": 0.0,
-            "平均分": 0.0,
-            "得分率": "0.00%",
-            "详细结果": [],
-        }
-
-    total_score = sum(r.get("总分") or 0 for r in filtered)
-    total_max = sum(r.get("满分") or 0 for r in filtered)
-    count = len(filtered)
-
-    avg_score = total_score / count if count > 0 else 0
-    score_rate = (total_score / total_max * 100) if total_max > 0 else 0
-
     return {
         "过滤条件": {
             "Agent名称": agent_name or "全部",
@@ -199,11 +176,7 @@ def calc_filtered_stats(
             "题目编号范围": f"{question_id_min or '开始'} ~ {question_id_max or '结束'}",
             "去重": dedupe_latest,
         },
-        "题目数": count,
-        "总得分": round(total_score, 2),
-        "总满分": round(total_max, 2),
-        "平均分": round(avg_score, 2),
-        "得分率": f"{score_rate:.2f}%",
+        **calc_stats(filtered),
         "详细结果": filtered,
     }
 
@@ -216,6 +189,11 @@ def print_filtered_stats(stats: dict[str, Any], show_details: bool = False):
         print(f"  {key}: {value}")
     print(f"{'='*60}")
     print(f"题目数: {stats['题目数']}")
+    print(f"有效题目数: {stats['有效题目数']}")
+    print(f"失败题目数: {stats['失败题目数']}")
+    print(f"评测成功率: {stats['评测成功率']}")
+    if stats["失败分布"]:
+        print(f"失败分布: {stats['失败分布']}")
     print(f"总得分: {stats['总得分']}")
     print(f"总满分: {stats['总满分']}")
     print(f"平均分: {stats['平均分']}")

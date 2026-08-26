@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for durable NutriMaster index build requests
+
+[Path]
+# Keep this path aligned with RAG_INDEX_DIR when production overrides it.
+DirectoryNotEmpty=/root/code/nutrimaster-current/data/index/builder-state/jobs/pending
+Unit=nutrimaster-index-builder.service
+
+[Install]
+WantedBy=multi-user.target

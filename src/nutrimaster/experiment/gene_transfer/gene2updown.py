@@ -9,6 +9,12 @@ from pathlib import Path
 
 from Bio import Entrez, SeqIO
 
+from nutrimaster.experiment.resource_limits import (
+    ExperimentResourceLimitError,
+    MAX_NCBI_SEQUENCE_BASES,
+    NCBISequenceBudget,
+)
+
 logger = logging.getLogger(__name__)
 
 ENTREZ_EMAIL = "nutrimaster_rag@example.com"
@@ -203,6 +209,8 @@ def _fetch_region(
     stop: int,
     strand: int = 1,
     pause: float = 0.34,
+    sequence_budget: NCBISequenceBudget | None = None,
+    label: str | None = None,
 ):
     """
     从 NCBI nuccore 获取指定基因组区间序列。
@@ -217,6 +225,15 @@ def _fetch_region(
     if stop < start:
         return None
 
+    requested_length = stop - start + 1
+    if requested_length > MAX_NCBI_SEQUENCE_BASES:
+        # Reject from the trusted coordinate metadata before asking Entrez to
+        # stream a response that the unified service is not allowed to retain.
+        raise ExperimentResourceLimitError(
+            f"NCBI sequence {(label or f'{accession}:{start}-{stop}')!r} exceeds "
+            f"the hard per-record limit of {MAX_NCBI_SEQUENCE_BASES} bases"
+        )
+
     time.sleep(pause)
 
     with Entrez.efetch(
@@ -228,12 +245,16 @@ def _fetch_region(
         seq_stop=stop,
         strand=strand,
     ) as handle:
-        records = list(SeqIO.parse(handle, "fasta"))
+        record = next(SeqIO.parse(handle, "fasta"), None)
 
-    if not records:
+    if record is None:
         return None
-
-    return records[0]
+    budget = sequence_budget or NCBISequenceBudget()
+    budget.consume_length(
+        len(record.seq),
+        label=label or f"{accession}:{start}-{stop}",
+    )
+    return record
 
 
 def get_gene_flanks(
@@ -242,6 +263,7 @@ def get_gene_flanks(
     upstream: int = 2000,
     downstream: int = 1000,
     pause: float = 0.34,
+    sequence_budget: NCBISequenceBudget | None = None,
 ) -> dict:
     """
     获取某基因的上游、基因本体、下游序列。
@@ -258,6 +280,7 @@ def get_gene_flanks(
     - gene / upstream / downstream 返回序列均按基因转录方向输出
     """
     location = _get_gene_location(gene_name, species)
+    sequence_budget = sequence_budget or NCBISequenceBudget()
 
     if location.strand == 1:
         upstream_start = max(1, location.start - upstream)
@@ -291,6 +314,8 @@ def get_gene_flanks(
         stop=upstream_stop,
         strand=fetch_strand,
         pause=pause,
+        sequence_budget=sequence_budget,
+        label=f"{gene_name}:upstream",
     )
 
     gene_record = _fetch_region(
@@ -299,6 +324,8 @@ def get_gene_flanks(
         stop=gene_stop,
         strand=fetch_strand,
         pause=pause,
+        sequence_budget=sequence_budget,
+        label=f"{gene_name}:gene",
     )
 
     downstream_record = _fetch_region(
@@ -307,6 +334,8 @@ def get_gene_flanks(
         stop=downstream_stop,
         strand=fetch_strand,
         pause=pause,
+        sequence_budget=sequence_budget,
+        label=f"{gene_name}:downstream",
     )
 
     if upstream_record:
@@ -367,6 +396,7 @@ def write_gene_flanks(
     Entrez.email = ENTREZ_EMAIL
 
     records = []
+    sequence_budget = NCBISequenceBudget()
 
     for item in genes:
         gene_name = item["gene"]
@@ -378,6 +408,7 @@ def write_gene_flanks(
                 species=species,
                 upstream=upstream,
                 downstream=downstream,
+                sequence_budget=sequence_budget,
             )
 
             location = result["gene_location"]
@@ -401,6 +432,8 @@ def write_gene_flanks(
             if result["downstream_record"]:
                 records.append(result["downstream_record"])
 
+        except (MemoryError, ExperimentResourceLimitError):
+            raise
         except Exception as exc:
             logger.warning("获取 %s 上下游序列失败: %s", gene_name, exc)
 
@@ -447,6 +480,7 @@ def run_gene_transfer_sequences(
     """
     Entrez.email = ENTREZ_EMAIL
     results: list[GeneSequenceResult] = []
+    sequence_budget = NCBISequenceBudget()
 
     for item in genes:
         gene_name = item["gene"]
@@ -458,6 +492,7 @@ def run_gene_transfer_sequences(
                 species=species,
                 upstream=upstream,
                 downstream=downstream,
+                sequence_budget=sequence_budget,
             )
             location = flanks["gene_location"]
 
@@ -475,6 +510,8 @@ def run_gene_transfer_sequences(
                     downstream_seq=down_seq,
                 )
             )
+        except (MemoryError, ExperimentResourceLimitError):
+            raise
         except Exception as exc:
             logger.warning("获取 %s 序列失败: %s", gene_name, exc)
 

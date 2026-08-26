@@ -2,6 +2,7 @@
 // 负责：Supabase 初始化、登录/注册/登出、全局 token 管理、管理员检测
 
 let supabaseClient = null;   // Supabase JS 客户端实例
+let authInitPromise = null;  // 共享初始化任务，避免表单提交早于 /api/config 返回
 let currentSession = null;   // 当前登录会话（含 access_token）
 let userProfile = null;      // 用户 profile（含 is_admin、nickname）
 let adminPort = 5501;        // 管理后台端口（从 /api/config 获取）
@@ -42,7 +43,10 @@ function handleAvatarFileChange(e) {
 
 // ===== 初始化 Supabase 客户端 =====
 async function initAuth() {
-    try {
+    if (supabaseClient?.auth) return supabaseClient;
+    if (authInitPromise) return authInitPromise;
+
+    authInitPromise = (async () => {
         if (typeof supabase === 'undefined' || !supabase?.createClient) {
             throw new Error('Supabase SDK 加载失败');
         }
@@ -59,23 +63,49 @@ async function initAuth() {
         }
 
         // 用 anon key 初始化客户端（公开的，安全）
-        supabaseClient = supabase.createClient(cfg.supabase_url, cfg.supabase_anon_key);
+        const client = supabase.createClient(cfg.supabase_url, cfg.supabase_anon_key);
+        if (!client?.auth) {
+            throw new Error('Supabase 客户端创建失败');
+        }
         if (cfg.admin_port) adminPort = cfg.admin_port;
         if (cfg.site_url) siteUrl = cfg.site_url;
 
         // 监听登录状态变化（刷新页面、token 过期等）
         // onAuthStateChange 会自动触发 INITIAL_SESSION 事件，无需再手动 getSession
-        supabaseClient.auth.onAuthStateChange((event, session) => {
+        client.auth.onAuthStateChange((event, session) => {
             currentSession = session;
             handleAuthStateChange(session).catch(err => {
                 console.error('处理登录状态变化失败:', err);
             });
         });
 
+        supabaseClient = client;
+        return client;
+    })();
+
+    try {
+        return await authInitPromise;
     } catch (err) {
+        supabaseClient = null;
         console.error('认证初始化失败:', err);
         showLoginOverlay();
         showAuthError(err.message || '认证初始化失败');
+        throw err;
+    } finally {
+        // 失败后允许用户再次提交时重试配置请求；成功时客户端本身即为缓存。
+        if (!supabaseClient) authInitPromise = null;
+    }
+}
+
+// 登录/注册可能发生在页面启动的异步初始化完成之前，所有认证操作都必须等待它。
+async function getReadyAuthClient() {
+    try {
+        const client = await initAuth();
+        if (!client?.auth) throw new Error('认证客户端不可用');
+        return client;
+    } catch (err) {
+        const detail = err?.message || '请刷新页面后重试';
+        throw new Error(`认证服务初始化失败：${detail}`);
     }
 }
 
@@ -102,7 +132,8 @@ function getAccessToken() {
 
 // ===== 邮箱+密码登录 =====
 async function loginWithEmail(email, password) {
-    const { data, error } = await supabaseClient.auth.signInWithPassword({
+    const client = await getReadyAuthClient();
+    const { data, error } = await client.auth.signInWithPassword({
         email: email,
         password: password,
     });
@@ -113,12 +144,13 @@ async function loginWithEmail(email, password) {
 
 // ===== 邮箱+密码注册（支持 nickname 和 avatar_url） =====
 async function signUpWithEmail(email, password, metadata) {
+    const client = await getReadyAuthClient();
     const options = {};
     if (metadata) options.data = metadata;
     // 指定邮箱验证后的跳转地址（使用实际部署地址，而非 localhost）
     if (siteUrl) options.emailRedirectTo = siteUrl;
 
-    const { data, error } = await supabaseClient.auth.signUp({
+    const { data, error } = await client.auth.signUp({
         email: email,
         password: password,
         options: options,
@@ -130,7 +162,8 @@ async function signUpWithEmail(email, password, metadata) {
 
 // ===== 登出 =====
 async function logout() {
-    const { error } = await supabaseClient.auth.signOut();
+    const client = await getReadyAuthClient();
+    const { error } = await client.auth.signOut();
     if (error) throw error;
     currentSession = null;
 }
@@ -651,7 +684,8 @@ async function handleDeleteAccount() {
         // 删除成功 → 登出
         const popover = document.getElementById('user-popover');
         if (popover) popover.remove();
-        await supabaseClient.auth.signOut();
+        const client = await getReadyAuthClient();
+        await client.auth.signOut();
         currentSession = null;
         userProfile = null;
         const avatarEl = document.getElementById('user-avatar');

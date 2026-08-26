@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
@@ -19,24 +19,40 @@ class FileStorageAdapter:
     写入到本地文件系统的指定路径。
     """
 
-    def __init__(self, upload_file: UploadFile):
+    def __init__(self, upload_file: UploadFile, *, max_bytes: int):
         """初始化文件存储适配器。
 
         参数:
             upload_file: FastAPI 的 UploadFile 实例。
+            max_bytes: 流式写入允许的最大字节数。
         """
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
         self._file = upload_file
+        self._max_bytes = int(max_bytes)
 
     def save(self, path):
         """将上传文件的内容保存到指定的本地路径。
 
-        使用 shutil.copyfileobj 进行流式复制，避免大文件内存溢出。
+        分块复制上传内容，并在超过上限时立即停止，避免缺少或伪造
+        Content-Length 的请求写满磁盘。
 
         参数:
             path: 目标文件路径（字符串或 Path 对象）。
         """
-        with open(path, "wb") as output:
-            shutil.copyfileobj(self._file.file, output)
+        target = Path(path)
+        written = 0
+        try:
+            with target.open("wb") as output:
+                while chunk := self._file.file.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > self._max_bytes:
+                        max_mb = self._max_bytes / (1024 * 1024)
+                        raise ValueError(f"文件过大，最大 {max_mb:g}MB")
+                    output.write(chunk)
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
 
 
 @router.post("/api/personal/upload")
@@ -68,7 +84,12 @@ async def personal_upload(
         raise HTTPException(status_code=400, detail="仅支持 PDF 文件")
     try:
         library = services.get_personal_lib(user.id)
-        info = await asyncio.to_thread(library.upload_pdf, FileStorageAdapter(file), file.filename)
+        max_bytes = int(library.rag_settings.max_pdf_size_mb * 1024 * 1024)
+        info = await asyncio.to_thread(
+            library.upload_pdf,
+            FileStorageAdapter(file, max_bytes=max_bytes),
+            file.filename,
+        )
         return JSONResponse({"status": "ok", "file": info})
     except (ValueError, ImportError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -73,7 +73,10 @@ def extract_transgenic_species_with_llm(answer_text: str) -> list[str]:
     Returns:
         list[str]: 推断出的受体物种拉丁名列表；无法推断时返回空列表。
     """
-    from nutrimaster.config.llm import call_llm_sync
+    from nutrimaster.experiment.llm import (
+        ExperimentUnavailableError,
+        call_experiment_llm,
+    )
     import json
 
     prompt = (
@@ -94,7 +97,10 @@ def extract_transgenic_species_with_llm(answer_text: str) -> list[str]:
         f"文本：\n{answer_text}"
     )
     try:
-        raw = call_llm_sync([{"role": "user", "content": prompt}], temperature=0).content
+        raw = call_experiment_llm(
+            [{"role": "user", "content": prompt}],
+            temperature=0,
+        ).content
         text = raw.strip()
         if "```" in text:
             text = text.split("```")[1]
@@ -103,6 +109,10 @@ def extract_transgenic_species_with_llm(answer_text: str) -> list[str]:
         result = json.loads(text.strip())
         if isinstance(result, list):
             return [s for s in result if isinstance(s, str) and s.strip()]
+    except MemoryError:
+        raise
+    except ExperimentUnavailableError:
+        raise
     except Exception:
         pass
     return []
@@ -137,6 +147,8 @@ def verify_genes_with_ncbi(genes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         gene_name = gene.get("gene", "")
         try:
             gene_ids = _search_gene_ids(gene_name, species)
+        except MemoryError:
+            raise
         except Exception:
             gene_ids = []
         verified.append(

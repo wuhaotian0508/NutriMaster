@@ -11,6 +11,13 @@ from nutrimaster.rag.evidence import (
     normalize_url,
     title_key,
 )
+from nutrimaster.rag.field_keyword import (
+    ConceptSpec,
+    FieldKeywordRetriever,
+    FieldKeywordSpec,
+    SurfaceForm,
+    coerce_keyword_spec,
+)
 from nutrimaster.rag.gene_index import (
     GeneChunk,
     IncrementalIndexer,
@@ -50,6 +57,9 @@ __all__ = [
     "EvidenceFusion",
     "EvidenceItem",
     "EvidencePacket",
+    "ConceptSpec",
+    "FieldKeywordRetriever",
+    "FieldKeywordSpec",
     "GeneDbSource",
     "GraphDbSource",
     "GraphPath",
@@ -79,7 +89,9 @@ __all__ = [
     "ResolvedNode",
     "RetrievalService",
     "SourceCollector",
+    "SurfaceForm",
     "chunk_paper",
+    "coerce_keyword_spec",
     "extract_graph_query",
     "normalize_doi",
     "normalize_pmid",

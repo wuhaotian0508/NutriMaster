@@ -1,0 +1,33 @@
+[Unit]
+Description=NutriMaster isolated immutable-generation index builder
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+Slice=nutrimaster.slice
+User=root
+WorkingDirectory=/root/code/nutrimaster-current
+ExecStart=/root/code/nutrimaster-current/start-index-builder-production.sh
+ExecStopPost=/root/code/nutrimaster-current/start-index-builder-production.sh recover-interrupted
+TimeoutStartSec=infinity
+# ExecStopPost may need reset-failed (30s), a graceful unified restart (420s),
+# and rollback-generation health verification (120s). Keep additional margin
+# so systemd does not SIGKILL the recovery process after it restores CURRENT.
+TimeoutStopSec=660
+KillSignal=SIGTERM
+KillMode=control-group
+MemoryAccounting=true
+# See nutrimaster-unified.service for the v1/v2 compatibility rationale.
+MemoryHigh=2G
+MemoryMax=2560M
+MemoryLimit=2560M
+MemorySwapMax=0
+# Under a shared-slice OOM, bias victim selection toward the rebuild rather
+# than either live service (the kernel still makes the final victim choice).
+OOMScoreAdjust=500
+TasksMax=128
+LimitNOFILE=65536
+NoNewPrivileges=true

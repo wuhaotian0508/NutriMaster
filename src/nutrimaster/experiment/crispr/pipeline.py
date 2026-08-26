@@ -10,7 +10,7 @@ from nutrimaster.experiment.crispr import gene2accession as step1_gene2acc
 from nutrimaster.experiment.crispr import accession2sequence as step2_acc2seq
 from nutrimaster.experiment.crispr import crispr_target as step3_crispr
 from nutrimaster.experiment.crispr import experiment_design as step4_design
-from nutrimaster.config.llm import call_llm_sync
+from nutrimaster.experiment.llm import call_experiment_llm
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,12 @@ class ExperimentPipeline:
             "如果没有找到，返回空数组 []。\n\n"
             f"文本：\n{answer_text}"
         )
-        genes = _json_from_llm_text(call_llm_sync([{"role": "user", "content": prompt}], temperature=0).content)
+        genes = _json_from_llm_text(
+            call_experiment_llm(
+                [{"role": "user", "content": prompt}],
+                temperature=0,
+            ).content
+        )
         if not isinstance(genes, list) or not genes:
             raise ValueError("未从回答中提取到建议编辑的基因")
         return genes
@@ -103,7 +108,12 @@ class ExperimentPipeline:
             '返回 JSON 数组格式: [{"gene": "GmFAD2", "species": "Glycine max"}]\n\n'
             f"文本：\n{answer_text}"
         )
-        genes = _json_from_llm_text(call_llm_sync([{"role": "user", "content": prompt}], temperature=0).content)
+        genes = _json_from_llm_text(
+            call_experiment_llm(
+                [{"role": "user", "content": prompt}],
+                temperature=0,
+            ).content
+        )
         if not isinstance(genes, list) or not genes:
             raise ValueError("未能为选定的基因解析物种信息")
         return genes
@@ -145,6 +155,11 @@ class ExperimentPipeline:
             sops = step4_design.run_experiment_design(fasta_files, target_files, self.work_dir)
             yield {"type": "progress", "step": 4, "total": 4, "msg": "实验方案生成完成", "done": True}
             yield {"type": "result", "sops": sops}
+        except MemoryError:
+            # Memory exhaustion is a process-level capacity signal.  The Web
+            # and service layers must see it unchanged instead of continuing
+            # to allocate while serializing a normal SSE error event.
+            raise
         except Exception as exc:
             logger.exception("实验方案 pipeline 执行出错")
             yield {"type": "error", "msg": str(exc)}

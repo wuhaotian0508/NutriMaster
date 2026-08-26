@@ -1,0 +1,10 @@
+[Unit]
+Description=Aggregate memory boundary for NutriMaster production services
+
+[Slice]
+MemoryAccounting=true
+# The production host is systemd 239 on cgroup v1. Keep the explicit legacy
+# MemoryLimit and matching MemoryMax so the common value reaches
+# memory.limit_in_bytes there and remains identical after a cgroup-v2 migration.
+MemoryLimit=5632M
+MemoryMax=5632M

@@ -168,9 +168,17 @@ def split_items(value: Any) -> list[str]:
     """
     if not clean_value(value):
         return []
-    if isinstance(value, list):
-        return [clean_value(item) for item in value if clean_value(item)]
-    return [clean_value(item) for item in re.split(r"[;,\n]", str(value)) if clean_value(item)]
+    raw_items = value if isinstance(value, list) else re.split(r"[;,\n]", str(value))
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = clean_value(item)
+        key = normalize_name(text)
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        items.append(text)
+    return items
 
 
 def gene_species(gene: dict[str, Any]) -> str:
@@ -281,23 +289,71 @@ def stable_node_id(node_type: str, name: str, species: str = "") -> str:
 
 
 def stable_edge_id(src: str, dst: str, relation: str, evidence: dict[str, Any]) -> str:
-    """生成边去重 ID，保证重复导入 corpus 不会重复建边。
+    """生成语义级边 ID，保证整体图里同一邻接关系只建一条边。
 
     Args:
         src: 起点节点 ID。
         dst: 终点节点 ID。
         relation: 关系类型。
-        evidence: 来源证据，至少包含 DOI/source_file/section/record_index。
+        evidence: 兼容旧调用保留的参数；语义去重不依赖单条记录来源。
 
     Returns:
-        SHA1 字符串。同一篇论文同一条抽取记录会被视为同一条边。
+        SHA1 字符串。只要 src/dst/relation 相同，就视为同一条全局邻接边。
     """
     raw = {
         "src": src,
         "dst": dst,
         "relation": relation_type(relation),
-        "paper": evidence.get("doi") or evidence.get("source_file") or "",
-        "section": evidence.get("section") or "",
-        "record_index": evidence.get("record_index"),
     }
     return hashlib.sha1(json.dumps(raw, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def relationship_evidence(
+    evidence: dict[str, Any],
+    *,
+    relation: str,
+    field: str,
+    item: str = "",
+    item_index: int = 0,
+) -> dict[str, Any]:
+    """给边证据补充全局唯一的关系索引元数据。
+
+    Args:
+        evidence: 论文级和记录级证据。
+        relation: 关系类型。
+        field: 产生这条关系的 schema 字段，例如 Primary_Product。
+        item: 字段拆分后的具体值。
+        item_index: 同一字段拆分后的序号。
+
+    Returns:
+        新 evidence 字典，包含 record_key/relationship_index/relationship_key。
+    """
+    paper = clean_value(evidence.get("doi")) or Path(clean_value(evidence.get("source_file"))).name
+    section = clean_value(evidence.get("section"))
+    record_index = evidence.get("record_index")
+    rel = relation_type(relation)
+    record_key = f"{paper}::{section}[{record_index}]"
+    relationship_index = f"{record_key}::{field}[{item_index}]::{rel}"
+    relationship_key = hashlib.sha1(
+        json.dumps(
+            {
+                "paper": paper,
+                "section": section,
+                "record_index": record_index,
+                "relation": rel,
+                "field": field,
+                "item": normalize_name(item),
+                "item_index": item_index,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        **evidence,
+        "record_key": record_key,
+        "relationship_index": relationship_index,
+        "relationship_key": relationship_key,
+        "relationship_field": field,
+        "relationship_item": clean_value(item),
+        "relationship_item_index": item_index,
+    }

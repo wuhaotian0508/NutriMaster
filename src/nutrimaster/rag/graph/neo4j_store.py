@@ -11,6 +11,7 @@ from nutrimaster.rag.graph.schema import (
     node_label,
     normalize_name,
     relation_type,
+    relationship_evidence,
     split_items,
     stable_edge_id,
     stable_node_id,
@@ -94,6 +95,8 @@ class Neo4jGraphStore:
             with self.session() as session:
                 session.run("RETURN 1 AS ok").single()
             return True
+        except MemoryError:
+            raise
         except Exception:
             return False
 
@@ -132,9 +135,9 @@ class Neo4jGraphStore:
         Returns:
             写入统计，包含 files/nodes/edges。
         """
-        self.initialize_schema()
         if reset:
             self.clear_graph()
+        self.initialize_schema()
 
         corpus = Path(corpus_dir)
         total_files = 0
@@ -188,12 +191,14 @@ class Neo4jGraphStore:
             f"""
             MATCH (src:GraphNode {{id: $src}}), (dst:GraphNode {{id: $dst}})
             MERGE (src)-[r:{relation} {{id: $id}}]->(dst)
-            SET r += $props
+            ON CREATE SET r += $props
+            ON MATCH SET r.evidence_count = coalesce(r.evidence_count, 1) + $evidence_count
             """,
             src=edge["src"],
             dst=edge["dst"],
             id=edge["id"],
             props=props,
+            evidence_count=int(props.get("evidence_count") or 1),
         ).consume()
 
     def _paper_to_rows(self, path: Path) -> dict[str, list[dict[str, Any]]]:
@@ -201,6 +206,8 @@ class Neo4jGraphStore:
             import json
 
             paper = json.loads(path.read_text(encoding="utf-8"))
+        except MemoryError:
+            raise
         except Exception:
             return {"nodes": [], "edges": []}
 
@@ -246,24 +253,55 @@ class _GraphRowsBuilder:
 
         substrates = split_items(gene.get("Primary_Substrate"))
         products = split_items(gene.get("Primary_Product"))
-        if substrates and products:
-            # Pathway 不直接连 Gene -> Product，而是插入 Reaction 节点。
-            # 这样可以表达“基因催化某个反应，反应消耗底物并生成产物”的方向。
-            reaction_name = (
-                clean_value(gene.get("Catalyzed_Reaction_Description"))
-                or f"{clean_value(gene.get('Gene_Name'))}: {'; '.join(substrates)} -> {'; '.join(products)}"
-            )
-            reaction = self._node("Reaction", reaction_name)
-            self._edge(gene_node, reaction, "CATALYZES", evidence)
-            for substrate in substrates:
-                self._edge(self._node("Metabolite", substrate), reaction, "INPUT_OF", evidence)
-            for product in products:
-                self._edge(reaction, self._node("Metabolite", product), "PRODUCES", evidence)
+        if substrates or products:
+            # 整体图以 Gene 为中心做邻接索引：Pathway 记录里的 a -> b -> c
+            # 只落成 a -> b 和 b -> c 两条邻接边，避免再额外索引一条链式关系。
+            for index, substrate in enumerate(substrates):
+                self._edge(
+                    self._node("Metabolite", substrate),
+                    gene_node,
+                    "INPUT_OF",
+                    evidence,
+                    field="Primary_Substrate",
+                    item=substrate,
+                    item_index=index,
+                )
+            for index, product in enumerate(products):
+                self._edge(
+                    gene_node,
+                    self._node("Metabolite", product),
+                    "PRODUCES",
+                    evidence,
+                    field="Primary_Product",
+                    item=product,
+                    item_index=index,
+                )
 
-        for metabolite in split_items(gene.get("Terminal_Metabolite")):
-            self._edge(gene_node, self._node("Metabolite", metabolite), "CONTRIBUTES_TO", evidence)
-        for pathway in split_items(gene.get("Biosynthetic_Pathway")) + split_items(gene.get("Pathway_Branch_or_Subpathway")):
-            self._edge(gene_node, self._node("Pathway", pathway), "PARTICIPATES_IN", evidence)
+        for index, metabolite in enumerate(split_items(gene.get("Terminal_Metabolite"))):
+            self._edge(
+                gene_node,
+                self._node("Metabolite", metabolite),
+                "CONTRIBUTES_TO",
+                evidence,
+                field="Terminal_Metabolite",
+                item=metabolite,
+                item_index=index,
+            )
+        pathway_items = (
+            ("Biosynthetic_Pathway", split_items(gene.get("Biosynthetic_Pathway"))),
+            ("Pathway_Branch_or_Subpathway", split_items(gene.get("Pathway_Branch_or_Subpathway"))),
+        )
+        for field, pathways in pathway_items:
+            for index, pathway in enumerate(pathways):
+                self._edge(
+                    gene_node,
+                    self._node("Pathway", pathway),
+                    "PARTICIPATES_IN",
+                    evidence,
+                    field=field,
+                    item=pathway,
+                    item_index=index,
+                )
         self._add_species_edge(gene_node, gene, evidence)
 
     def add_regulation_gene(self, gene: dict[str, Any], *, record_index: int) -> None:
@@ -275,14 +313,46 @@ class _GraphRowsBuilder:
         evidence = self._evidence(gene, section="Regulation_Genes", record_index=record_index, domain="regulation")
         evidence["mode"] = clean_value(gene.get("Regulation_Mode"))
 
-        for target in split_items(gene.get("Primary_Regulatory_Targets")):
-            self._edge(gene_node, self._node("Gene", target, species=species), "REGULATES", evidence)
-        for signal in split_items(gene.get("Upstream_Signals_or_Inputs")):
-            self._edge(self._node("Signal", signal), gene_node, "UPSTREAM_SIGNAL_OF", evidence)
-        for process in split_items(gene.get("Metabolic_Process_Controlled")):
-            self._edge(gene_node, self._node("Process", process), "CONTROLS", evidence)
-        for metabolite in split_items(gene.get("Terminal_Metabolite")):
-            self._edge(gene_node, self._node("Metabolite", metabolite), "AFFECTS", evidence)
+        for index, target in enumerate(split_items(gene.get("Primary_Regulatory_Targets"))):
+            self._edge(
+                gene_node,
+                self._node("Gene", target, species=species),
+                "REGULATES",
+                evidence,
+                field="Primary_Regulatory_Targets",
+                item=target,
+                item_index=index,
+            )
+        for index, signal in enumerate(split_items(gene.get("Upstream_Signals_or_Inputs"))):
+            self._edge(
+                self._node("Signal", signal),
+                gene_node,
+                "UPSTREAM_SIGNAL_OF",
+                evidence,
+                field="Upstream_Signals_or_Inputs",
+                item=signal,
+                item_index=index,
+            )
+        for index, process in enumerate(split_items(gene.get("Metabolic_Process_Controlled"))):
+            self._edge(
+                gene_node,
+                self._node("Process", process),
+                "CONTROLS",
+                evidence,
+                field="Metabolic_Process_Controlled",
+                item=process,
+                item_index=index,
+            )
+        for index, metabolite in enumerate(split_items(gene.get("Terminal_Metabolite"))):
+            self._edge(
+                gene_node,
+                self._node("Metabolite", metabolite),
+                "AFFECTS",
+                evidence,
+                field="Terminal_Metabolite",
+                item=metabolite,
+                item_index=index,
+            )
         self._add_species_edge(gene_node, gene, evidence)
 
     def add_common_gene(self, gene: dict[str, Any], *, record_index: int) -> None:
@@ -291,11 +361,26 @@ class _GraphRowsBuilder:
         if not gene_node:
             return
         evidence = self._evidence(gene, section="Common_Genes", record_index=record_index, domain="common")
-        for metabolite in split_items(gene.get("Terminal_Metabolite")):
-            self._edge(gene_node, self._node("Metabolite", metabolite), "AFFECTS", evidence)
+        for index, metabolite in enumerate(split_items(gene.get("Terminal_Metabolite"))):
+            self._edge(
+                gene_node,
+                self._node("Metabolite", metabolite),
+                "AFFECTS",
+                evidence,
+                field="Terminal_Metabolite",
+                item=metabolite,
+                item_index=index,
+            )
         phenotype = clean_value(gene.get("Core_Phenotypic_Effect"))
         if phenotype:
-            self._edge(gene_node, self._node("Phenotype", phenotype), "HAS_EFFECT", evidence)
+            self._edge(
+                gene_node,
+                self._node("Phenotype", phenotype),
+                "HAS_EFFECT",
+                evidence,
+                field="Core_Phenotypic_Effect",
+                item=phenotype,
+            )
         self._add_species_edge(gene_node, gene, evidence)
 
     def _gene_node(self, gene: dict[str, Any]) -> str:
@@ -325,24 +410,58 @@ class _GraphRowsBuilder:
         }
         return node_id
 
-    def _edge(self, src: str, dst: str, relation: str, evidence: dict[str, Any]) -> None:
+    def _edge(
+        self,
+        src: str,
+        dst: str,
+        relation: str,
+        evidence: dict[str, Any],
+        *,
+        field: str,
+        item: str = "",
+        item_index: int = 0,
+    ) -> None:
         if not src or not dst:
             return
         rel = relation_type(relation)
-        edge_id = stable_edge_id(src, dst, rel, evidence)
+        edge_evidence = relationship_evidence(
+            evidence,
+            relation=rel,
+            field=field,
+            item=item,
+            item_index=item_index,
+        )
+        edge_id = stable_edge_id(src, dst, rel, edge_evidence)
+        existing = self.edges.get(edge_id)
+        if existing:
+            existing["evidence_count"] = int(existing.get("evidence_count") or 1) + 1
+            sections = set(existing.get("source_sections") or [])
+            if edge_evidence.get("section"):
+                sections.add(edge_evidence["section"])
+            existing["source_sections"] = sorted(sections)
+            return
         row = {
             "id": edge_id,
             "src": src,
             "dst": dst,
             "relation": rel,
-            **evidence,
+            "evidence_count": 1,
+            "source_sections": [edge_evidence["section"]] if edge_evidence.get("section") else [],
+            **edge_evidence,
         }
         self.edges[edge_id] = row
 
     def _add_species_edge(self, gene_node: str, gene: dict[str, Any], evidence: dict[str, Any]) -> None:
         species = clean_value(gene.get("Applied_Species_Latin_Name")) or clean_value(gene.get("Applied_Species"))
         if species:
-            self._edge(gene_node, self._node("Species", species), "TESTED_IN", evidence)
+            self._edge(
+                gene_node,
+                self._node("Species", species),
+                "TESTED_IN",
+                evidence,
+                field="Applied_Species",
+                item=species,
+            )
 
     def _evidence(self, gene: dict[str, Any], *, section: str, record_index: int, domain: str) -> dict[str, Any]:
         return {

@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nutrimaster.rag.graph.schema import relationship_evidence, stable_edge_id
+
 INVALID = {"", "-", "na", "n/a", "none", "null", "nan", "unknown", "not available"}
+GRAPH_INDEX_VERSION = "local-graph-v2"
+DEFAULT_EDGE_BATCH_SIZE = 2048
 
 
 def clean(value: Any) -> str:
@@ -26,9 +30,17 @@ def split_items(value: Any) -> list[str]:
     """把 'CHS; DFR; ANS' 这类字段拆成多个实体。"""
     if not clean(value):
         return []
-    if isinstance(value, list):
-        return [clean(x) for x in value if clean(x)]
-    return [clean(x) for x in re.split(r"[;,\n]", str(value)) if clean(x)]
+    raw_items = value if isinstance(value, list) else re.split(r"[;,\n]", str(value))
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = clean(item)
+        key = norm(text)
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        items.append(text)
+    return items
 
 
 def species_of(gene: dict[str, Any]) -> str:
@@ -49,16 +61,74 @@ def node_id(node_type: str, name: str, species: str = "") -> str:
 
 
 def edge_id(src: str, dst: str, relation: str, evidence: dict[str, Any]) -> str:
-    """边去重 ID：同一篇论文同一条记录不会重复插入。"""
-    raw = {
-        "src": src,
-        "dst": dst,
-        "relation": relation,
-        "paper": evidence.get("doi") or evidence.get("source_file") or "",
-        "section": evidence.get("section") or "",
-        "record_index": evidence.get("record_index"),
-    }
-    return hashlib.sha1(json.dumps(raw, sort_keys=True).encode("utf-8")).hexdigest()
+    """边去重 ID：整体图里同一 src/relation/dst 只保留一条邻接边。"""
+    return stable_edge_id(src, dst, relation, evidence)
+
+
+def _evidence_payload(evidence: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(evidence)
+    payload["evidence_count"] = 1
+    payload["source_sections"] = [evidence["section"]] if evidence.get("section") else []
+    return payload
+
+
+def _merge_evidence_payload(existing_json: str, evidence: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(existing_json)
+    except json.JSONDecodeError:
+        payload = {}
+    return _merge_evidence_payload_dict(payload, evidence)
+
+
+def _merge_evidence_payload_dict(payload: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(payload or {})
+    for key, value in evidence.items():
+        if value and not merged.get(key):
+            merged[key] = value
+    merged["evidence_count"] = int(merged.get("evidence_count") or 1) + 1
+    sections = set(merged.get("source_sections") or [])
+    if evidence.get("section"):
+        sections.add(evidence["section"])
+    merged["source_sections"] = sorted(sections)
+    return merged
+
+
+def _merge_batched_evidence_payload(
+    existing_json: str,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge two already-aggregated evidence payloads without losing counts.
+
+    The in-memory edge cache is deliberately bounded, so the same semantic
+    edge can be encountered again after an earlier batch has been flushed to
+    SQLite.  Combining the two aggregates must be equivalent to feeding every
+    observation through ``_merge_evidence_payload_dict`` in corpus order.
+    """
+
+    try:
+        existing = json.loads(existing_json)
+    except json.JSONDecodeError:
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if key in {"evidence_count", "source_sections"}:
+            continue
+        if value and not merged.get(key):
+            merged[key] = value
+
+    merged["evidence_count"] = (
+        int(existing.get("evidence_count") or 1)
+        + int(incoming.get("evidence_count") or 1)
+    )
+    sections = set(existing.get("source_sections") or [])
+    sections.update(incoming.get("source_sections") or [])
+    if incoming.get("section"):
+        sections.add(incoming["section"])
+    merged["source_sections"] = sorted(sections)
+    return merged
 
 
 @dataclass(frozen=True)
@@ -71,21 +141,44 @@ class GraphSearchResult:
 class LocalGraphIndex:
     """本地 SQLite 图索引：负责建图、去重、解析主体、取局部邻域。"""
 
-    def __init__(self, db_path: Path | str):
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        edge_batch_size: int = DEFAULT_EDGE_BATCH_SIZE,
+    ):
         self.db_path = Path(db_path)
+        if not isinstance(edge_batch_size, int) or isinstance(edge_batch_size, bool):
+            raise ValueError("edge_batch_size must be a positive integer")
+        if edge_batch_size <= 0:
+            raise ValueError("edge_batch_size must be a positive integer")
+        self.edge_batch_size = edge_batch_size
 
-    def connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.db_path)
+    def connect(self, *, read_only: bool = False) -> sqlite3.Connection:
+        if read_only:
+            uri = f"{self.db_path.resolve().as_uri()}?mode=ro&immutable=1"
+            db = sqlite3.connect(uri, uri=True)
+            db.execute("PRAGMA query_only=ON")
+        else:
+            db = sqlite3.connect(self.db_path)
         db.row_factory = sqlite3.Row
         return db
 
     def initialize(self) -> None:
         """重建图索引；图可以从 corpus 再生成，所以直接清空更简单。"""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.db_path.exists():
+            self.db_path.unlink()
         with self.connect() as db:
             db.executescript("""
             DROP TABLE IF EXISTS edges;
             DROP TABLE IF EXISTS nodes;
+            DROP TABLE IF EXISTS metadata;
+
+            CREATE TABLE metadata(
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            ) WITHOUT ROWID;
 
             CREATE TABLE nodes(
               id TEXT PRIMARY KEY,
@@ -109,29 +202,51 @@ class LocalGraphIndex:
             CREATE INDEX idx_graph_edges_dst ON edges(dst);
             """)
 
-    def build_from_corpus(self, corpus_dir: Path | str) -> None:
-        """从 data/corpus/*.json 建图。"""
+    def build_from_corpus(
+        self,
+        corpus_dir: Path | str,
+        *,
+        corpus_fingerprint: str | None = None,
+    ) -> None:
+        """从 data/corpus/*.json 建图，并绑定对应的 retrieval corpus。"""
         self.initialize()
         with self.connect() as db:
-            for path in sorted(Path(corpus_dir).glob("*.json")):
-                try:
-                    paper = json.loads(path.read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    continue
+            self._pending_edges: dict[str, dict[str, Any]] = {}
+            try:
+                corpus_files = 0
+                for path in sorted(Path(corpus_dir).glob("*.json")):
+                    try:
+                        paper = json.loads(path.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError:
+                        continue
+                    corpus_files += 1
 
-                base = {
-                    "source_file": str(path),
-                    "title": clean(paper.get("Title")),
-                    "journal": clean(paper.get("Journal")),
-                    "doi": clean(paper.get("DOI")),
-                }
+                    base = {
+                        "source_file": str(path),
+                        "title": clean(paper.get("Title")),
+                        "journal": clean(paper.get("Journal")),
+                        "doi": clean(paper.get("DOI")),
+                    }
 
-                for i, gene in enumerate(paper.get("Pathway_Genes") or []):
-                    self._add_pathway_gene(db, gene, base | {"section": "Pathway_Genes", "record_index": i})
-                for i, gene in enumerate(paper.get("Regulation_Genes") or []):
-                    self._add_regulation_gene(db, gene, base | {"section": "Regulation_Genes", "record_index": i})
-                for i, gene in enumerate(paper.get("Common_Genes") or []):
-                    self._add_common_gene(db, gene, base | {"section": "Common_Genes", "record_index": i})
+                    for i, gene in enumerate(paper.get("Pathway_Genes") or []):
+                        self._add_pathway_gene(db, gene, base | {"section": "Pathway_Genes", "record_index": i})
+                    for i, gene in enumerate(paper.get("Regulation_Genes") or []):
+                        self._add_regulation_gene(db, gene, base | {"section": "Regulation_Genes", "record_index": i})
+                    for i, gene in enumerate(paper.get("Common_Genes") or []):
+                        self._add_common_gene(db, gene, base | {"section": "Common_Genes", "record_index": i})
+                self._flush_pending_edges(db)
+            finally:
+                # Do not retain corpus-derived evidence after a successful or
+                # failed build on a long-lived LocalGraphIndex instance.
+                self._pending_edges = {}
+            db.executemany(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                (
+                    ("version", GRAPH_INDEX_VERSION),
+                    ("corpus_fingerprint", corpus_fingerprint or ""),
+                    ("corpus_files", str(corpus_files)),
+                ),
+            )
 
     def _add_node(self, db: sqlite3.Connection, node_type: str, name: str, species: str = "") -> str:
         """插入节点；INSERT OR IGNORE 实现节点去重。"""
@@ -145,14 +260,91 @@ class LocalGraphIndex:
         )
         return nid
 
-    def _add_edge(self, db: sqlite3.Connection, src: str, dst: str, relation: str, evidence: dict[str, Any]) -> None:
+    def _add_edge(
+        self,
+        db: sqlite3.Connection,
+        src: str,
+        dst: str,
+        relation: str,
+        evidence: dict[str, Any],
+        *,
+        field: str,
+        item: str = "",
+        item_index: int = 0,
+    ) -> None:
         """插入边；每条边都带 evidence_json，方便回答时引用来源。"""
         if not src or not dst:
             return
-        db.execute(
-            "INSERT OR IGNORE INTO edges VALUES (?, ?, ?, ?, ?)",
-            (edge_id(src, dst, relation, evidence), src, dst, relation, json.dumps(evidence, ensure_ascii=False)),
+        edge_evidence = relationship_evidence(
+            evidence,
+            relation=relation,
+            field=field,
+            item=item,
+            item_index=item_index,
         )
+        eid = edge_id(src, dst, relation, edge_evidence)
+        pending_edges = getattr(self, "_pending_edges", None)
+        if pending_edges is not None:
+            existing = pending_edges.get(eid)
+            if existing:
+                existing["evidence"] = _merge_evidence_payload_dict(existing["evidence"], edge_evidence)
+                return
+            pending_edges[eid] = {
+                "id": eid,
+                "src": src,
+                "dst": dst,
+                "relation": relation,
+                "evidence": _evidence_payload(edge_evidence),
+            }
+            if len(pending_edges) >= self.edge_batch_size:
+                self._flush_pending_edges(db)
+            return
+
+        existing = db.execute("SELECT evidence_json FROM edges WHERE id = ?", (eid,)).fetchone()
+        if existing:
+            payload = _merge_evidence_payload(existing["evidence_json"], edge_evidence)
+            db.execute("UPDATE edges SET evidence_json = ? WHERE id = ?", (json.dumps(payload, ensure_ascii=False), eid))
+            return
+        db.execute(
+            "INSERT INTO edges VALUES (?, ?, ?, ?, ?)",
+            (eid, src, dst, relation, json.dumps(_evidence_payload(edge_evidence), ensure_ascii=False)),
+        )
+
+    def _flush_pending_edges(self, db: sqlite3.Connection) -> None:
+        """Flush the bounded edge cache and merge cross-batch duplicates."""
+
+        pending_edges = getattr(self, "_pending_edges", None)
+        if not pending_edges:
+            return
+        for edge in pending_edges.values():
+            evidence_json = json.dumps(edge["evidence"], ensure_ascii=False)
+            inserted = db.execute(
+                "INSERT OR IGNORE INTO edges VALUES (?, ?, ?, ?, ?)",
+                (
+                    edge["id"],
+                    edge["src"],
+                    edge["dst"],
+                    edge["relation"],
+                    evidence_json,
+                ),
+            )
+            if inserted.rowcount:
+                continue
+            existing = db.execute(
+                "SELECT evidence_json FROM edges WHERE id = ?",
+                (edge["id"],),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError("graph edge disappeared during batch merge")
+            payload = _merge_batched_evidence_payload(
+                existing["evidence_json"],
+                edge["evidence"],
+            )
+            db.execute(
+                "UPDATE edges SET evidence_json = ? WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False), edge["id"]),
+            )
+        pending_edges.clear()
 
     def _gene_node(self, db: sqlite3.Connection, gene: dict[str, Any]) -> str:
         return self._add_node(db, "Gene", clean(gene.get("Gene_Name")), species_of(gene))
@@ -169,13 +361,30 @@ class LocalGraphIndex:
             "summary": clean(gene.get("Summary_Key_Findings_of_Core_Gene")),
         }
 
-        substrate = clean(gene.get("Primary_Substrate"))
-        product = clean(gene.get("Primary_Product"))
-        if substrate and product:
-            reaction = self._add_node(db, "Reaction", f"{clean(gene.get('Gene_Name'))}: {substrate} -> {product}")
-            self._add_edge(db, self._add_node(db, "Metabolite", substrate), reaction, "input_of", evidence)
-            self._add_edge(db, g, reaction, "catalyzes", evidence)
-            self._add_edge(db, reaction, self._add_node(db, "Metabolite", product), "produces", evidence)
+        substrates = split_items(gene.get("Primary_Substrate"))
+        products = split_items(gene.get("Primary_Product"))
+        for index, substrate in enumerate(substrates):
+            self._add_edge(
+                db,
+                self._add_node(db, "Metabolite", substrate),
+                g,
+                "input_of",
+                evidence,
+                field="Primary_Substrate",
+                item=substrate,
+                item_index=index,
+            )
+        for index, product in enumerate(products):
+            self._add_edge(
+                db,
+                g,
+                self._add_node(db, "Metabolite", product),
+                "produces",
+                evidence,
+                field="Primary_Product",
+                item=product,
+                item_index=index,
+            )
 
         for field, relation, node_type in (
             ("Terminal_Metabolite", "contributes_to", "Metabolite"),
@@ -184,7 +393,7 @@ class LocalGraphIndex:
         ):
             value = clean(gene.get(field))
             if value:
-                self._add_edge(db, g, self._add_node(db, node_type, value), relation, evidence)
+                self._add_edge(db, g, self._add_node(db, node_type, value), relation, evidence, field=field, item=value)
 
     def _add_regulation_gene(self, db: sqlite3.Connection, gene: dict[str, Any], evidence: dict[str, Any]) -> None:
         """Regulation_Genes: regulator -> target / signal -> regulator。"""
@@ -200,16 +409,51 @@ class LocalGraphIndex:
             "summary": clean(gene.get("Summary_Key_Findings_of_Core_Gene")),
         }
 
-        for target in split_items(gene.get("Primary_Regulatory_Targets")):
-            self._add_edge(db, g, self._add_node(db, "Gene", target, species), "regulates", evidence)
-        for signal in split_items(gene.get("Upstream_Signals_or_Inputs")):
-            self._add_edge(db, self._add_node(db, "Signal", signal), g, "upstream_signal_of", evidence)
+        for index, target in enumerate(split_items(gene.get("Primary_Regulatory_Targets"))):
+            self._add_edge(
+                db,
+                g,
+                self._add_node(db, "Gene", target, species),
+                "regulates",
+                evidence,
+                field="Primary_Regulatory_Targets",
+                item=target,
+                item_index=index,
+            )
+        for index, signal in enumerate(split_items(gene.get("Upstream_Signals_or_Inputs"))):
+            self._add_edge(
+                db,
+                self._add_node(db, "Signal", signal),
+                g,
+                "upstream_signal_of",
+                evidence,
+                field="Upstream_Signals_or_Inputs",
+                item=signal,
+                item_index=index,
+            )
 
         process = clean(gene.get("Metabolic_Process_Controlled"))
         if process:
-            self._add_edge(db, g, self._add_node(db, "Process", process), "controls", evidence)
-        for terminal in split_items(gene.get("Terminal_Metabolite")):
-            self._add_edge(db, g, self._add_node(db, "Metabolite", terminal), "affects", evidence)
+            self._add_edge(
+                db,
+                g,
+                self._add_node(db, "Process", process),
+                "controls",
+                evidence,
+                field="Metabolic_Process_Controlled",
+                item=process,
+            )
+        for index, terminal in enumerate(split_items(gene.get("Terminal_Metabolite"))):
+            self._add_edge(
+                db,
+                g,
+                self._add_node(db, "Metabolite", terminal),
+                "affects",
+                evidence,
+                field="Terminal_Metabolite",
+                item=terminal,
+                item_index=index,
+            )
 
     def _add_common_gene(self, db: sqlite3.Connection, gene: dict[str, Any], evidence: dict[str, Any]) -> None:
         """Common_Genes: 更宽泛的 gene-metabolite/phenotype/species 关系。"""
@@ -230,7 +474,7 @@ class LocalGraphIndex:
         ):
             value = clean(gene.get(field))
             if value:
-                self._add_edge(db, g, self._add_node(db, node_type, value), relation, evidence)
+                self._add_edge(db, g, self._add_node(db, node_type, value), relation, evidence, field=field, item=value)
 
     def resolve_seeds(self, query: str, *, species: str = "", limit: int = 12) -> list[dict[str, Any]]:
         """从用户问题里确定图搜索主体；先 exact match，再模糊 match。"""
@@ -244,7 +488,7 @@ class LocalGraphIndex:
         if not values or not self.db_path.exists():
             return []
 
-        with self.connect() as db:
+        with self.connect(read_only=True) as db:
             marks = ",".join("?" for _ in values)
             rows = db.execute(
                 f"SELECT * FROM nodes WHERE norm_name IN ({marks}) ORDER BY type='Gene' DESC LIMIT ?",
@@ -280,7 +524,7 @@ class LocalGraphIndex:
         frontier = set(seen)
         edges: list[dict[str, Any]] = []
 
-        with self.connect() as db:
+        with self.connect(read_only=True) as db:
             for _ in range(max(1, hops)):
                 if not frontier or len(edges) >= limit:
                     break

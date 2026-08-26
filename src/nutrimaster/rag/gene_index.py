@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import pickle
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -918,6 +919,10 @@ def chunk_paper(paper: dict[str, Any]) -> list[GeneChunk]:
     route = route_paper(paper)
     try:
         chunks = chunkers[route].chunk(paper)
+    except MemoryError:
+        # Allocator exhaustion is not a strategy incompatibility. Running the
+        # generic chunker would immediately repeat corpus-sized work.
+        raise
     except Exception:
         route = "generic"
         chunks = chunkers["generic"].chunk(paper)
@@ -1072,19 +1077,27 @@ class IncrementalIndexer:
             if i % 10 == 0 or i == len(to_rebuild):
                 logger.info(f"Progress: {i}/{len(to_rebuild)} files processed, {cursor} total chunks")
 
-        final_embeddings = None
-        if final_embedding_parts:
-            final_embeddings = (
-                np.concatenate(final_embedding_parts, axis=0)
-                if len(final_embedding_parts) > 1
-                else final_embedding_parts[0]
-            )
-        if final_chunks and final_embeddings is None:
+        if final_chunks and not final_embedding_parts:
             raise RuntimeError("chunks exist but embeddings are missing")
-        if final_embeddings is not None and final_embeddings.shape[0] != len(final_chunks):
+        embedding_rows = sum(int(part.shape[0]) for part in final_embedding_parts)
+        if final_embedding_parts and embedding_rows != len(final_chunks):
             raise RuntimeError("final embeddings do not match chunks")
 
-        self._save(final_chunks, final_embeddings, new_manifest)
+        # Assemble directly into the atomic on-disk NPY temporary.  The former
+        # np.concatenate path allocated a second corpus-sized dense matrix while
+        # the old mmap/new embedding parts were still live.  On production that
+        # avoidable copy was hundreds of MiB at the exact sparse/graph build
+        # hand-off where memory headroom matters most.
+        self._save_embedding_parts(
+            final_chunks,
+            final_embedding_parts or None,
+            new_manifest,
+        )
+        final_embeddings = (
+            np.load(self.embeds_path, mmap_mode="r")
+            if final_embedding_parts
+            else None
+        )
         return final_chunks, final_embeddings
 
     def _load_paper(self, path: Path) -> list[GeneChunk]:
@@ -1114,6 +1127,8 @@ class IncrementalIndexer:
             if data.get("chunker_version") != CHUNKER_VERSION:
                 return {}
             return data.get("files", {})
+        except MemoryError:
+            raise
         except Exception:
             return {}
 
@@ -1132,10 +1147,15 @@ class IncrementalIndexer:
         try:
             with self.chunks_path.open("rb") as file:
                 chunks = pickle.load(file)
-            embeddings = np.load(self.embeds_path)
+            # Incremental rebuilds only read slices of the previous matrix.
+            # Keep those pages file-backed instead of materializing another
+            # corpus-sized anonymous ndarray in the builder cgroup.
+            embeddings = np.load(self.embeds_path, mmap_mode="r")
             if len(chunks) != embeddings.shape[0]:
                 return [], None
             return chunks, embeddings
+        except MemoryError:
+            raise
         except Exception:
             return [], None
 
@@ -1179,20 +1199,95 @@ class IncrementalIndexer:
             embeddings: 嵌入矩阵（可为 None）。
             manifest_files: 文件记录字典，将写入 manifest.json。
         """
-        with self.chunks_path.open("wb") as file:
-            pickle.dump(chunks, file)
-        if embeddings is not None:
-            np.save(self.embeds_path, embeddings)
-        elif self.embeds_path.exists():
-            self.embeds_path.unlink()
-        self.manifest_path.write_text(
-            json.dumps(
-                {"chunker_version": CHUNKER_VERSION, "files": manifest_files},
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        self._save_embedding_parts(
+            chunks,
+            None if embeddings is None else [embeddings],
+            manifest_files,
         )
+
+    def _save_embedding_parts(
+        self,
+        chunks: list[GeneChunk],
+        embedding_parts: list[np.ndarray] | None,
+        manifest_files: dict,
+    ) -> None:
+        """Atomically save chunks and a bounded-memory dense matrix.
+
+        ``embedding_parts`` may contain mmap slices from the previous
+        generation and small arrays returned for changed corpus files.  They
+        are copied one at a time into an NPY memmap, so no concatenated dense
+        matrix is ever allocated on the Python heap.
+        """
+
+        shape: tuple[int, int] | None = None
+        dtype: np.dtype | None = None
+        if embedding_parts:
+            arrays = [np.asanyarray(part) for part in embedding_parts]
+            if any(part.ndim != 2 for part in arrays):
+                raise RuntimeError("embedding parts must be two-dimensional")
+            width = int(arrays[0].shape[1])
+            if any(int(part.shape[1]) != width for part in arrays):
+                raise RuntimeError("embedding dimensions do not match")
+            rows = sum(int(part.shape[0]) for part in arrays)
+            if rows != len(chunks):
+                raise RuntimeError("embedding rows do not match chunks")
+            dtype = np.dtype(np.result_type(*(part.dtype for part in arrays)))
+            if not np.issubdtype(dtype, np.number):
+                raise RuntimeError("embedding dtype must be numeric")
+            shape = (rows, width)
+        else:
+            arrays = []
+
+        suffix = f".{os.getpid()}.tmp"
+        chunks_tmp = self.chunks_path.with_name(f".{self.chunks_path.name}{suffix}")
+        embeds_tmp = self.embeds_path.with_name(f".{self.embeds_path.name}{suffix}")
+        manifest_tmp = self.manifest_path.with_name(f".{self.manifest_path.name}{suffix}")
+        for path in (chunks_tmp, embeds_tmp, manifest_tmp):
+            path.unlink(missing_ok=True)
+        try:
+            with chunks_tmp.open("wb") as file:
+                pickle.dump(chunks, file)
+                file.flush()
+                os.fsync(file.fileno())
+            if shape is not None and dtype is not None:
+                mapped = np.lib.format.open_memmap(
+                    embeds_tmp,
+                    mode="w+",
+                    dtype=dtype,
+                    shape=shape,
+                )
+                cursor = 0
+                try:
+                    for part in arrays:
+                        end = cursor + int(part.shape[0])
+                        mapped[cursor:end] = part
+                        cursor = end
+                    mapped.flush()
+                finally:
+                    del mapped
+                with embeds_tmp.open("rb") as file:
+                    os.fsync(file.fileno())
+            with manifest_tmp.open("w", encoding="utf-8") as file:
+                json.dump(
+                    {"chunker_version": CHUNKER_VERSION, "files": manifest_files},
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                file.flush()
+                os.fsync(file.fileno())
+
+            # All potentially failing serialization completes before the live
+            # files move.  Manifest is the commit marker and is replaced last.
+            chunks_tmp.replace(self.chunks_path)
+            if shape is not None:
+                embeds_tmp.replace(self.embeds_path)
+            elif self.embeds_path.exists():
+                self.embeds_path.unlink()
+            manifest_tmp.replace(self.manifest_path)
+        finally:
+            for path in (chunks_tmp, embeds_tmp, manifest_tmp):
+                path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -1321,7 +1416,7 @@ class RetrievalService:
 
         Args:
             force: 强制重建索引。
-            incremental: 是否使用增量构建（当前参数未使用）。
+            incremental: 是否使用增量构建；False 时要求底层检索器全量重建。
         """
         self.retriever.build_index(force=force, incremental=incremental)
 

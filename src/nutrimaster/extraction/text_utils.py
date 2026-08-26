@@ -211,6 +211,8 @@ If nothing should be removed, return: []"""
 
     try:
         return _try_call(get_openai_client(), EXTRACTOR_MODEL)
+    except MemoryError:
+        raise
     except Exception as e:
         print(f"    ⚠️  [text_utils] LLM section 分类失败: {e}")
 

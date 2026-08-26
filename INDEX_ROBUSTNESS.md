@@ -1,287 +1,131 @@
-# RAG 索引更新鲁棒性保证
+# RAG 索引一致性与恢复设计
 
-## 设计目标
+当前方案不再使用“每篇论文在 Web 内立即重建 + Pipeline 结束再重建 +
+cron/CLI 兜底”。该旧方案会在请求服务中反复加载语料级对象，并且可与查询、
+第二 Python 服务或另一次重建叠加，是生产 OOM 的重要诱因。
 
-**确保 `data/corpus/` 中的所有 JSON 文件都能被索引到 `data/index/manifest.json` 中，无论发生什么情况。**
+新方案的目标是：对一份稳定 corpus 快照构建一个经过完整校验的不可变
+generation，只在新 generation 可用时原子激活，并在激活失败时保留可验证回滚点。
 
-## 多层防护机制
+## 核心不变式
 
-### 1. 实时增量更新（主要机制）
+1. 生产只有一个 FastAPI `5000` 进程加载全局索引；Pi Node `8787` 不加载
+   索引。新的 unified 启动前，旧 `5000`/`5002` 必须先下线，避免瞬时
+   重复驻留索引。
+2. 一个 generation 必须同时包含 chunks、dense embeddings/norms、紧凑 BM25、
+   字段关键词 SQLite FTS 和 Graph SQLite。生产不允许缺任何分支启动。
+3. Web 只读 active generation。它不在启动、在线请求、单篇回调或 Pipeline 结束时
+   直接写入检索产物。
+4. 任何 Admin 索引操作都先持久化排队；只有受 systemd 内存限制的 isolated
+   builder 有权构建和发布。
+5. builder 全局串行，同时只允许一次构建。Admin Pipeline 也只允许一个实例且
+   `max_workers=1`。
+6. `CURRENT` 只能指向完整验证的最终 generation，不能指向 staging、symlink 链
+   或未发布工作目录。
 
-**触发时机**：每篇论文处理成功后立即执行
+## 触发与状态语义
 
-**实现位置**：`src/nutrimaster/web/admin/app.py` - `_on_paper_done()` 回调
+下列操作只提交 durable job：
 
-```python
-def _on_paper_done(filename: str, result: dict, done: int, total: int, parallel: bool):
-    if status == "success":
-        try:
-            _refresh_index(DATA_DIR, force=False)  # 增量模式，只处理新文件
-        except Exception as e:
-            print(f"⚠️ 索引增量更新失败（将在结束时重试）: {e}")
+- Admin 单篇处理成功；
+- Admin Pipeline 正常完成或在当前论文完成后停止；
+- Admin Dashboard 手动 Rebuild。
+
+任务先原子写入：
+
+```text
+RAG_INDEX_DIR/builder-state/jobs/pending/
 ```
 
-**优点**：
-- ✅ 每篇论文处理完立即索引，不会遗漏
-- ✅ 中途停止不影响已处理的文件
-- ✅ 增量索引很快（只处理新文件，SHA256 去重）
+HTTP `202` / `queued` 的语义仅是“请求已持久化”。它不代表已开始构建、已发布
+或已在 Web 中生效。必须根据 durable status 和 `/api/health` 判定最终结果。
 
-**覆盖场景**：
-- ✅ Pipeline 正常运行
-- ✅ Pipeline 中途被用户停止
-- ✅ Pipeline 运行时崩溃/异常退出
+主要状态为：
 
-### 2. Pipeline 结束时兜底更新（第二层防护）
-
-**触发时机**：Pipeline 结束时（无论正常完成还是被停止）
-
-**实现位置**：`src/nutrimaster/web/admin/app.py` - Pipeline 主线程
-
-```python
-stopped = run_result["stopped"]
-# 无论 stopped 是 True 还是 False，都执行索引更新
-eq.put(("rebuilding_index", {}))
-try:
-    _refresh_index(DATA_DIR, force=False)
-    eq.put(("index_rebuilt", {}))
-except Exception as e:
-    eq.put(("index_error", {"error": str(e)}))
+```text
+queued -> preflight -> snapshotting -> building -> activating
+       -> succeeded | awaiting_activation | failed
 ```
 
-**优点**：
-- ✅ 兜底机制，确保所有文件都被索引
-- ✅ 即使实时更新失败，结束时也会重试
-- ✅ 用户停止 Pipeline 也会触发索引更新
+## 完整 generation 构建
 
-**覆盖场景**：
-- ✅ 实时更新失败的情况
-- ✅ 用户中途停止 Pipeline
-- ✅ 最后一批文件的索引更新
+builder 持有排他锁后执行：
 
-### 3. Admin Panel 手动触发（第三层防护）
+1. 清理只属于上次中断构建的未发布 staging/snapshot；
+2. 根据当前 corpus 规模执行磁盘预检；
+3. 创建稳定、私有的 JSON corpus 快照；
+4. 构建 chunks、dense embeddings/norms、紧凑 CSR BM25、字段关键词 FTS 和 Graph；
+5. 检查文件 hash、数组 shape/有限值、corpus fingerprint、BM25 契约和 SQLite 完整性；
+6. 将完整目录发布为不可变 generation，并原子替换 `CURRENT`；
+7. 受控重启 unified，等待 `/api/health` 报告精确的新 generation ID。
 
-**触发方式**：用户点击 Dashboard 的 "🔄 Rebuild Index" 按钮
+只有第 7 步验证成功才记录 `succeeded`。这比“manifest 已写入”更强：它确认
+实际服务进程已加载指定 generation。
 
-**实现位置**：
-- 后端：`src/nutrimaster/web/admin/app.py` - `/api/index/rebuild`
-- 前端：`src/nutrimaster/web/admin/static/admin.js` - `rebuildIndex()`
+## 磁盘预检和两代保留
 
-**优点**：
-- ✅ 用户可以随时手动触发
-- ✅ 支持异步执行，不阻塞界面
-- ✅ 实时显示索引状态（已索引/缺失文件数）
+预检在任何 staging 写入前完成，要求足够空间容纳：
 
-**覆盖场景**：
-- ✅ 自动更新失败后的手动修复
-- ✅ 直接拷贝 JSON 文件到 corpus 的情况
-- ✅ 用户主动检查和修复索引
+- 一份完整新 generation；
+- 两份 dense workspace（含 atomic-save 临时件）；
+- 一份稳定 corpus snapshot；
+- 1 GiB 安全余量。
 
-### 4. CLI 脚本触发（第四层防护）
+当前 103,024 chunks 的参考值是：generation 约 3.1 GiB，构建额外需求约
+5.833 GiB。该数值不是固定配置，必须以每次 builder 按实际语料计算的结果为准。
 
-**触发方式**：运行 `rebuild_index_robust.py` 脚本
+激活成功后保留策略保护：
 
-**实现位置**：`rebuild_index_robust.py`
+- `CURRENT` 指向的正在服务 generation；
+- 紧邻的上一代 serving/rollback generation。
+
+清理只能删除更旧、已验证、命名为 64 位十六进制的最终 generation。它不得删除
+`CURRENT`、rollback generation、symlink 或无效目录。如果两代被保护时预检仍失败，
+应扩容或将经运维批准的更旧归档移出本机；不得删除任何受保护世代强行开工。
+
+## 中断、OOM 和激活失败
+
+- 构建或校验失败：任务记为 `failed`，`CURRENT` 保持不变。
+- 激活失败：builder 原子切回记录的旧 generation，重启 unified，并验证回滚 ID。
+- OOM、SIGTERM 或被迫中断：systemd `ExecStopPost` 读取 durable activation state，执行同样的
+  回滚恢复，并在下次预检前清理不可能被 `CURRENT` 引用的私有 staging/snapshot。
+- 手工 maintenance mode：`NUTRIMASTER_INDEX_BUILDER_AUTO_ACTIVATE=false` 只能记录
+  `awaiting_activation`，在 Web 实际报告新 ID 前不得标记成功。
+
+unified 最长优雅停止窗口为 360 秒，builder 恢复窗口为 660 秒。受控激活期间
+`deactivating` 持续数分钟可能是正常排空；在窗口内再次 kill 会破坏可恢复语义。
+
+## 监控与验证
+
+查看 durable 状态和 builder 日志：
 
 ```bash
-# 前台运行（实时查看进度）
-python3 rebuild_index_robust.py
-
-# 后台运行
-nohup python3 rebuild_index_robust.py > rebuild.log 2>&1 &
+.venv/bin/python -m nutrimaster.rag.index_builder_cli status
+journalctl -u nutrimaster-index-builder.service -n 200 --no-pager
 ```
 
-**优点**：
-- ✅ 独立于 Web 应用，可以离线运行
-- ✅ 无缓冲输出，实时查看进度
-- ✅ 适合大批量索引重建
-
-**覆盖场景**：
-- ✅ Web 应用未运行时的索引更新
-- ✅ 批量导入 JSON 文件后的索引重建
-- ✅ 定时任务（cron）自动检查和更新
-
-## 增量索引机制
-
-**核心原理**：通过 SHA256 哈希值判断文件是否需要重新索引
-
-**实现位置**：`src/nutrimaster/rag/gene_index.py` - `IncrementalIndexer.build_incremental()`
-
-```python
-# 对每个文件计算 SHA256
-file_shas = {path.name: sha256_of(path) for path in files}
-
-# 检查是否需要重建
-for path in files:
-    entry = manifest.get(path.name)
-    if entry and entry.get("sha") == file_shas[path.name]:
-        to_keep.append(path.name)  # 文件未变化，保留旧索引
-    else:
-        to_rebuild.append(path)     # 文件新增或修改，重新索引
-```
-
-**性能优化**：
-- ✅ 只处理新增或修改的文件
-- ✅ 未变化的文件直接复用旧的 embeddings
-- ✅ 单个文件更新只需 2-3 秒（取决于 Jina API 速度）
-
-## 所有可能场景的覆盖情况
-
-| 场景 | 实时更新 | 结束时兜底 | 手动触发 | CLI 脚本 | 是否遗漏 |
-|------|---------|-----------|---------|---------|---------|
-| Pipeline 正常完成 | ✅ | ✅ | ✅ | ✅ | ❌ 不会 |
-| Pipeline 中途停止 | ✅ | ✅ | ✅ | ✅ | ❌ 不会 |
-| Pipeline 崩溃/异常 | ✅ | ❌ | ✅ | ✅ | ❌ 不会* |
-| 直接拷贝 JSON 文件 | ❌ | ❌ | ✅ | ✅ | ❌ 不会** |
-| 网络/API 失败 | ⚠️ | ✅ | ✅ | ✅ | ❌ 不会 |
-| 多次运行 Pipeline | ✅ | ✅ | ✅ | ✅ | ❌ 不会 |
-
-**注释**：
-- \* 崩溃时实时更新已处理的文件，未处理的可通过手动触发或 CLI 补齐
-- \*\* 直接拷贝文件需要用户手动触发索引更新（Dashboard 会显示缺失文件数）
-
-## 监控和可见性
-
-### Dashboard 索引状态卡片
-
-实时显示索引健康状态：
-
-```
-📊 RAG Index Status
-  Indexed Files: 18,181 / 18,181
-  Total Chunks: 134,661
-  Last Updated: May 8, 11:30 PM
-  Status: ✅ Synced
-  
-  [🔄 Rebuild Index]
-```
-
-**状态指示**：
-- ✅ Synced - 所有文件都已索引
-- ⚠️ N files missing - 有文件未索引
-- ❌ Error - 索引损坏或不可用
-
-### Pipeline Log 高亮
-
-索引相关事件在 Pipeline log 中高亮显示：
-
-```
-🔄 Rebuilding RAG index...
-✅ RAG index rebuilt successfully
-❌ Index rebuild failed: [error message]
-```
-
-### SSE 实时事件
-
-前端通过 SSE 接收索引更新事件：
-
-- `rebuilding_index` - 开始重建索引
-- `index_rebuilt` - 索引重建成功
-- `index_error` - 索引重建失败
-
-## 故障恢复
-
-### 场景 1：索引更新失败
-
-**症状**：Dashboard 显示 "⚠️ N files missing"
-
-**恢复步骤**：
-1. 点击 Dashboard 的 "🔄 Rebuild Index" 按钮
-2. 或运行 CLI 脚本：`python3 rebuild_index_robust.py`
-
-### 场景 2：Pipeline 崩溃后索引不完整
-
-**症状**：corpus 中有新文件，但 manifest 中没有
-
-**恢复步骤**：
-1. 重启 Flask 应用
-2. 访问 Dashboard，查看索引状态
-3. 点击 "🔄 Rebuild Index" 按钮
-
-### 场景 3：直接拷贝了大量 JSON 文件
-
-**症状**：Dashboard 显示大量缺失文件
-
-**恢复步骤**：
-1. 运行 CLI 脚本（推荐，适合大批量）：
-   ```bash
-   nohup python3 rebuild_index_robust.py > rebuild.log 2>&1 &
-   tail -f rebuild.log  # 查看进度
-   ```
-2. 或通过 Admin Panel 手动触发（适合少量文件）
-
-## 性能考虑
-
-### 实时更新的开销
-
-- **单个文件**：2-3 秒（Jina API 调用）
-- **增量检查**：<0.1 秒（SHA256 计算 + manifest 查询）
-- **总开销**：每篇论文增加 2-3 秒
-
-**是否可接受？**
-- ✅ 可接受 - 论文提取本身需要 30-60 秒
-- ✅ 增量索引很快，不会重复计算已索引的文件
-- ✅ 鲁棒性收益远大于性能开销
-
-### 批量更新的性能
-
-如果担心实时更新的开销，可以改为批量更新（每 N 篇更新一次）：
-
-```python
-# 每 10 篇或最后一篇时更新
-if status == "success" and (done % 10 == 0 or done == total):
-    _refresh_index(DATA_DIR, force=False)
-```
-
-**当前实现**：每篇实时更新（优先鲁棒性）
-
-## 测试验证
-
-### 测试 1：正常 Pipeline 流程
+校验 active generation：
 
 ```bash
-# 1. 上传 ZIP 文件
-# 2. 运行 Pipeline
-# 3. 检查 Dashboard 索引状态
-# 预期：所有文件都已索引，状态显示 "✅ Synced"
+.venv/bin/python -m nutrimaster.rag.index_builder_cli verify-active
+curl --fail --silent http://127.0.0.1:5000/api/health
 ```
 
-### 测试 2：中途停止 Pipeline
+Admin Dashboard 的 corpus/indexed 计数只是可观测信号，不能取代 generation 合同校验和
+Web 健康确认。
 
-```bash
-# 1. 运行 Pipeline
-# 2. 处理几篇论文后点击 "Stop"
-# 3. 检查 Dashboard 索引状态
-# 预期：已处理的文件都已索引
-```
+## 明确禁止的旧路径
 
-### 测试 3：手动触发索引重建
+生产不得：
 
-```bash
-# 1. 直接拷贝 JSON 文件到 data/corpus/
-# 2. 访问 Dashboard，查看缺失文件数
-# 3. 点击 "🔄 Rebuild Index"
-# 4. 等待完成，检查状态
-# 预期：所有文件都已索引
-```
+- 在 `_on_paper_done()` 中直接调用 `_refresh_index()` 构建全局索引；
+- 在 Pipeline 线程中同步构建或等待索引完成；
+- 设置 Web build-on-start/build-on-miss/online reindex 开关；
+- 通过 cron、nohup、tmux 或另一个 Python 进程直接运行
+  `rebuild_index_robust.py`、`build_sparse_indexes` 或 Graph CLI 写入 active index；
+- 并行运行两个 builder；
+- 为规避 OOM 而关闭 BM25、字段关键词或 Graph 功能。
 
-### 测试 4：CLI 脚本重建
-
-```bash
-# 1. 运行脚本
-python3 rebuild_index_robust.py
-
-# 2. 观察实时输出
-# 预期：显示进度，最终所有文件都已索引
-```
-
-## 总结
-
-通过**四层防护机制**（实时更新 + 结束时兜底 + 手动触发 + CLI 脚本），确保：
-
-✅ **完全鲁棒**：任何情况下都不会遗漏文件
-✅ **实时同步**：索引始终与 corpus 保持一致
-✅ **可监控**：Dashboard 实时显示索引健康状态
-✅ **可恢复**：多种方式手动修复索引
-✅ **高性能**：增量索引，只处理新文件
-
-**核心原则**：宁可多次更新（幂等操作），也不能遗漏文件。
+运维细节见 [`docs/index_builder_operations.md`](docs/index_builder_operations.md)，生产切流顺序见
+[`DEPLOYMENT_GUIDE.md`](DEPLOYMENT_GUIDE.md) 和
+[`DEPLOYMENT_CHECKLIST.md`](DEPLOYMENT_CHECKLIST.md)。

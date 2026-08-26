@@ -7,6 +7,12 @@ from pathlib import Path
 
 import requests
 
+from nutrimaster.experiment.resource_limits import (
+    ExperimentResourceLimitError,
+    MAX_NCBI_FASTA_RESPONSE_BYTES,
+    NCBISequenceBudget,
+)
+
 logger = logging.getLogger(__name__)
 
 _ENTREZ_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -70,9 +76,43 @@ def _fetch_fasta_text(accession: str, params: dict) -> str:
         try:
             for attempt in range(1, _MAX_RETRIES + 1):
                 try:
-                    response = session.get(_ENTREZ_EFETCH_URL, params=params, timeout=(10, 30))
+                    response = session.get(
+                        _ENTREZ_EFETCH_URL,
+                        params=params,
+                        timeout=(10, 30),
+                        stream=True,
+                    )
                     response.raise_for_status()
-                    return response.text.strip()
+                    declared_length = response.headers.get("content-length")
+                    if declared_length:
+                        try:
+                            if int(declared_length) > MAX_NCBI_FASTA_RESPONSE_BYTES:
+                                raise ExperimentResourceLimitError(
+                                    f"NCBI FASTA response for {accession!r} exceeds the hard "
+                                    f"limit of {MAX_NCBI_FASTA_RESPONSE_BYTES} bytes"
+                                )
+                        except ValueError:
+                            pass
+                    chunks: list[bytes] = []
+                    received = 0
+                    for chunk in response.iter_content(chunk_size=64 * 1024):
+                        if not chunk:
+                            continue
+                        if isinstance(chunk, str):
+                            chunk = chunk.encode(response.encoding or "utf-8")
+                        received += len(chunk)
+                        if received > MAX_NCBI_FASTA_RESPONSE_BYTES:
+                            raise ExperimentResourceLimitError(
+                                f"NCBI FASTA response for {accession!r} exceeds the hard "
+                                f"limit of {MAX_NCBI_FASTA_RESPONSE_BYTES} bytes"
+                            )
+                        chunks.append(chunk)
+                    return b"".join(chunks).decode(
+                        response.encoding or "utf-8",
+                        errors="strict",
+                    ).strip()
+                except ExperimentResourceLimitError:
+                    raise
                 except requests.exceptions.RequestException as exc:
                     last_error = exc
                     logger.warning(
@@ -128,6 +168,7 @@ def run_accession2sequence(accession_files: list[Path], work_dir: Path) -> list[
         raise ValueError("没有有效的 accession 可供下载序列")
 
     output_files = []
+    sequence_budget = NCBISequenceBudget()
     for species, rows in species_rows.items():
         filename = species.replace(" ", "_") + "_sequence.fas"
         fasta_file = work_dir / filename
@@ -150,6 +191,10 @@ def run_accession2sequence(accession_files: list[Path], work_dir: Path) -> list[
                     logger.warning("accession %s returned non-FASTA content, skipping", accession)
                     continue
                 lines = text.splitlines()
+                sequence = "".join(
+                    line.strip() for line in lines[1:] if line.strip()
+                )
+                sequence_budget.consume(sequence, label=accession)
                 lines[0] = f">{sp.replace(' ', '_')}_{gene}_{accession}"
                 output.write("\n".join(lines) + "\n")
                 time.sleep(0.34)

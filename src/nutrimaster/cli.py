@@ -103,7 +103,23 @@ def _run_web(args: argparse.Namespace) -> int:
     host = args.host or (rag.web_host if rag else "0.0.0.0")
     port = args.port or (rag.web_port if rag else 5000)
     reload = args.reload or (rag.debug if rag else False)
-    uvicorn.run("nutrimaster.web.app:app", host=host, port=port, reload=reload)
+    raw_limit = os.getenv("NUTRIMASTER_WEB_LIMIT_CONCURRENCY", "")
+    limit_concurrency = None
+    if raw_limit:
+        try:
+            limit_concurrency = int(raw_limit)
+        except ValueError as exc:
+            raise RuntimeError("NUTRIMASTER_WEB_LIMIT_CONCURRENCY must be an integer") from exc
+        if not 1 <= limit_concurrency <= 1024:
+            raise RuntimeError("NUTRIMASTER_WEB_LIMIT_CONCURRENCY must be between 1 and 1024")
+    uvicorn.run(
+        "nutrimaster.web.app:app",
+        host=host,
+        port=port,
+        reload=reload,
+        workers=1,
+        limit_concurrency=limit_concurrency,
+    )
     return 0
 
 

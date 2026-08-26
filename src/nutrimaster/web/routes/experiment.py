@@ -6,10 +6,25 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from nutrimaster.auth.service import get_current_user
+from nutrimaster.experiment.llm import ExperimentUnavailableError
+from nutrimaster.experiment.service import (
+    ExperimentBusyError,
+    ExperimentInputError,
+    normalize_experiment_genes,
+    normalize_experiment_goal,
+    normalize_recipient_species,
+    normalize_selected_gene_names,
+)
 from nutrimaster.web.deps import SSE_HEADERS, WebServices, get_services, sse
+from nutrimaster.web.request_limits import read_bounded_json_object
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+_MAX_EXPERIMENT_JSON_BODY_BYTES = 256 * 1024
+
+
+def _invalid_input(exc: ExperimentInputError) -> HTTPException:
+    return HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/api/experiment/preview")
@@ -33,12 +48,27 @@ async def experiment_preview(
         JSONResponse: 包含 genes 候选基因列表的 JSON 响应。
 
     异常:
-        HTTPException: 缺少 goal 和 genes 时返回 400，服务异常时返回 500。
+        HTTPException: 缺少 goal 和 genes 时返回 400；实验模型不可用时返回 503。
     """
-    data = await request.json()
-    goal = (data.get("goal") or data.get("query") or data.get("answer_text") or "").strip()
-    genes = data.get("genes") or None
-    selected_gene_names = data.get("selected_gene_names") or data.get("user_genes") or None
+    data = await read_bounded_json_object(
+        request,
+        max_bytes=_MAX_EXPERIMENT_JSON_BODY_BYTES,
+    )
+    try:
+        goal = normalize_experiment_goal(
+            data.get("goal") or data.get("query") or data.get("answer_text") or "",
+            allow_empty=True,
+        )
+        genes = normalize_experiment_genes(
+            data.get("genes"),
+            allow_none=True,
+            require_species=False,
+        )
+        selected_gene_names = normalize_selected_gene_names(
+            data.get("selected_gene_names") or data.get("user_genes")
+        )
+    except ExperimentInputError as exc:
+        raise _invalid_input(exc) from None
     if not goal and not genes:
         raise HTTPException(status_code=400, detail="缺少 goal 或 genes")
     try:
@@ -47,6 +77,12 @@ async def experiment_preview(
             genes=genes,
             selected_gene_names=selected_gene_names,
         )
+    except ExperimentBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from None
+    except ExperimentUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    except MemoryError:
+        raise
     except Exception as exc:
         logger.exception("[/api/experiment/preview] failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -81,10 +117,21 @@ async def experiment_run(
     异常:
         HTTPException: 缺少 genes 列表时返回 400。
     """
-    data = await request.json()
-    genes = data.get("genes")
-    if not genes:
+    data = await read_bounded_json_object(
+        request,
+        max_bytes=_MAX_EXPERIMENT_JSON_BODY_BYTES,
+    )
+    if not data.get("genes"):
         raise HTTPException(status_code=400, detail="缺少 genes 列表")
+    try:
+        genes = normalize_experiment_genes(
+            data.get("genes"),
+            require_nonempty=True,
+            require_species=True,
+        )
+    except ExperimentInputError as exc:
+        raise _invalid_input(exc) from None
+    assert genes is not None
 
     async def generate():
         try:
@@ -92,6 +139,10 @@ async def experiment_run(
                 if event.get("type") in ("progress", "result", "error"):
                     yield sse(event)
             yield sse({"type": "done"})
+        except ExperimentBusyError as exc:
+            yield sse({"type": "error", "data": str(exc)})
+        except MemoryError:
+            raise
         except Exception as exc:
             logger.exception("[/api/experiment/run] failed")
             yield sse({"type": "error", "data": str(exc)})
@@ -110,16 +161,31 @@ async def gene_transfer_preview(
     返回:
         JSONResponse: 包含 genes（验证后的基因列表）和 species（受体物种名列表）的 JSON。
     """
-    data = await request.json()
-    goal = (data.get("goal") or data.get("query") or data.get("answer_text") or "").strip()
-    selected_gene_names = data.get("selected_gene_names") or data.get("user_genes") or None
-    if not goal:
+    data = await read_bounded_json_object(
+        request,
+        max_bytes=_MAX_EXPERIMENT_JSON_BODY_BYTES,
+    )
+    raw_goal = data.get("goal") or data.get("query") or data.get("answer_text") or ""
+    if not raw_goal:
         raise HTTPException(status_code=400, detail="缺少 goal")
+    try:
+        goal = normalize_experiment_goal(raw_goal)
+        selected_gene_names = normalize_selected_gene_names(
+            data.get("selected_gene_names") or data.get("user_genes")
+        )
+    except ExperimentInputError as exc:
+        raise _invalid_input(exc) from None
     try:
         result = await services.gene_transfer_service.preview_species(
             goal=goal,
             selected_gene_names=selected_gene_names,
         )
+    except ExperimentBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from None
+    except ExperimentUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    except MemoryError:
+        raise
     except Exception as exc:
         logger.exception("[/api/gene-transfer/preview] failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -141,21 +207,53 @@ async def gene_transfer_run(
     SSE 事件类型:
         progress / result / done / error
     """
-    data = await request.json()
-    genes = data.get("genes")
-    species_list = data.get("species_list")
-    if not genes:
+    data = await read_bounded_json_object(
+        request,
+        max_bytes=_MAX_EXPERIMENT_JSON_BODY_BYTES,
+    )
+    if not data.get("genes"):
         raise HTTPException(status_code=400, detail="缺少 genes 列表")
-    if not species_list:
+    if not data.get("species_list"):
         raise HTTPException(status_code=400, detail="缺少 species_list 列表")
+    try:
+        genes = normalize_experiment_genes(
+            data.get("genes"),
+            require_nonempty=True,
+            require_species=True,
+        )
+        species_list = normalize_recipient_species(data.get("species_list"))
+    except ExperimentInputError as exc:
+        raise _invalid_input(exc) from None
+    assert genes is not None
 
     async def generate():
         try:
-            yield sse({"type": "progress", "step": 1, "total": 2, "msg": "正在从 NCBI 获取基因序列及上下游区域..."})
-            sops = await services.gene_transfer_service.run(genes=genes, species_list=species_list)
-            yield sse({"type": "progress", "step": 2, "total": 2, "msg": "正在填充转基因实验方案模板..."})
+            yield sse(
+                {
+                    "type": "progress",
+                    "step": 1,
+                    "total": 2,
+                    "msg": "正在从 NCBI 获取基因序列及上下游区域...",
+                }
+            )
+            sops = await services.gene_transfer_service.run(
+                genes=genes,
+                species_list=species_list,
+            )
+            yield sse(
+                {
+                    "type": "progress",
+                    "step": 2,
+                    "total": 2,
+                    "msg": "正在填充转基因实验方案模板...",
+                }
+            )
             yield sse({"type": "result", "sops": sops})
             yield sse({"type": "done"})
+        except ExperimentBusyError as exc:
+            yield sse({"type": "error", "data": str(exc)})
+        except MemoryError:
+            raise
         except Exception as exc:
             logger.exception("[/api/gene-transfer/run] failed")
             yield sse({"type": "error", "data": str(exc)})

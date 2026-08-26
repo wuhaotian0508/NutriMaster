@@ -1,8 +1,32 @@
-"""
-结果分析小工具 - 计算平均分、得分率等
-"""
+"""结果分析小工具 - 区分有效评分与评测链路故障。"""
 
+from collections import Counter
 from typing import Any
+
+
+FAILURE_STATUSES = {"agent_error", "judge_error", "runner_error"}
+
+
+def evaluation_failure_type(result: dict[str, Any]) -> str | None:
+    """返回评测失败类型，同时兼容没有 ``评测状态`` 的历史结果。"""
+    status = str(result.get("评测状态") or "").strip()
+    if status in FAILURE_STATUSES:
+        return status
+
+    error = str(result.get("error") or "").strip()
+    details = str(result.get("评分详情") or "").strip()
+    if details.startswith("Agent 失败:"):
+        return "agent_error"
+    if details.startswith("Judge 失败:"):
+        return "judge_error"
+    if error:
+        return "runner_error"
+    return None
+
+
+def is_failed_result(result: dict[str, Any]) -> bool:
+    """判断一条记录是否因评测基础设施失败而不可计分。"""
+    return evaluation_failure_type(result) is not None
 
 
 def calc_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -11,20 +35,32 @@ def calc_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
 
     results 格式: [{"题目编号": 1, "总分": 8.5, "满分": 10.0}, ...]
 
-    返回: {"题目数": 10, "总得分": 85.0, "总满分": 100.0, "平均分": 8.5, "得分率": "85.00%"}
+    失败记录仍保留在总题目数和失败分布中，但不会作为 0 分污染有效
+    得分。合法的 0 分记录（例如答案为空且 Judge 正常评分）仍参与统计。
     """
-    if not results:
-        return {"题目数": 0, "总得分": 0.0, "总满分": 0.0, "平均分": 0.0, "得分率": "0.00%"}
+    failed = [result for result in results if is_failed_result(result)]
+    scored = [result for result in results if not is_failed_result(result)]
+    failure_counts = Counter(
+        failure_type
+        for result in failed
+        if (failure_type := evaluation_failure_type(result)) is not None
+    )
 
-    total_score = sum(r.get("总分") or 0 for r in results)
-    total_max = sum(r.get("满分") or 0 for r in results)
-    count = len(results)
+    total_score = sum(result.get("总分") or 0 for result in scored)
+    total_max = sum(result.get("满分") or 0 for result in scored)
+    scored_count = len(scored)
+    total_count = len(results)
 
-    avg_score = total_score / count if count > 0 else 0
+    avg_score = total_score / scored_count if scored_count > 0 else 0
     score_rate = (total_score / total_max * 100) if total_max > 0 else 0
+    success_rate = (scored_count / total_count * 100) if total_count > 0 else 0
 
     return {
-        "题目数": count,
+        "题目数": total_count,
+        "有效题目数": scored_count,
+        "失败题目数": len(failed),
+        "评测成功率": f"{success_rate:.2f}%",
+        "失败分布": dict(sorted(failure_counts.items())),
         "总得分": round(total_score, 2),
         "总满分": round(total_max, 2),
         "平均分": round(avg_score, 2),
@@ -39,6 +75,11 @@ def print_stats(agent_name: str, version: str, stats: dict[str, Any]):
     print(f"版本: {version}")
     print(f"{'='*60}")
     print(f"题目数: {stats['题目数']}")
+    print(f"有效题目数: {stats['有效题目数']}")
+    print(f"失败题目数: {stats['失败题目数']}")
+    print(f"评测成功率: {stats['评测成功率']}")
+    if stats["失败分布"]:
+        print(f"失败分布: {stats['失败分布']}")
     print(f"总得分: {stats['总得分']}")
     print(f"总满分: {stats['总满分']}")
     print(f"平均分: {stats['平均分']}")

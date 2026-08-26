@@ -1,296 +1,153 @@
-# 部署和测试指南
+# NutriMaster 生产部署与切流指南
 
-## 已完成的改进
+本文是当前生产架构的唯一部署口径。旧的双 Python 服务、Web 内建索引和
+cron 直接重建方案已停用。
 
-### 后端改进（`src/nutrimaster/web/admin/app.py`）
+## 不可变的生产边界
 
-1. **新增 API 端点**：
-   - `/api/index/status` - 查询索引状态
-   - `/api/index/rebuild` - 手动触发索引重建
+- 只有一个单 worker FastAPI 进程，监听 `127.0.0.1:5000`。它共享一套
+  `WebServices` / `ToolRegistry` / `JinaRetriever`，同时服务
+  `/api/query`、`/api/pi/query`、Admin、个人库和实验路由。
+- Pi 是监听 `127.0.0.1:8787` 的 Node sidecar，只负责编排和流式输出，
+  不加载 Python 索引。
+- `5002` 只能用于离线预检之外的短期迁移诊断，不能与正式 unified
+  同时常驻。启动新的 `5000` 前，必须先停止并禁用已确认归属的旧
+  `5000`/`5002` 进程或单元，并确认两个端口都没有监听器。
+- dense、紧凑 BM25、字段关键词 SQLite FTS 和 SQLite Graph RAG 必须全部
+  启用。不得以关闭某个检索分支作为常态 OOM 解决方案。
+- Web 进程不得在启动、请求、单篇论文完成或 Pipeline 结束时直接构建
+  索引。所有变更都先写入 durable queue，且只由隔离的
+  `nutrimaster-index-builder.service` 构建。
+- 生产 Admin Pipeline 同时只允许一个实例，并且 `max_workers=1`。
 
-2. **实时增量索引**：
-   - 每篇论文处理成功后立即更新索引
-   - Pipeline 结束时兜底更新（无论正常完成还是被停止）
+## 为什么不能再运行 5000 + 5002
 
-3. **进度日志**（`src/nutrimaster/rag/gene_index.py`）：
-   - 每处理一个文件输出日志
-   - 每 10 个文件输出汇总进度
+旧 BM25 文件在磁盘上约 600 MB，但反序列化后的 Python 字典和 token list
+实测占用约 4.39 GiB。迁移前只有一份 Python/RAG 对象，内存只是勉强不越线；
+迁移后 `5000` 和 `5002` 重复加载 chunks、dense 和 Graph，再叠加索引构建临时对象，
+就会超过生产机内存。因此修复是合并服务、紧凑/内存映射索引和隔离 builder，
+而不是删减检索功能。
 
-### 前端改进（`src/nutrimaster/web/admin/static/`）
+## 切流前预检
 
-1. **Dashboard 索引状态卡片**（`index.html`）：
-   - 显示已索引/总文件数
-   - 显示总 chunks 数
-   - 显示最后更新时间
-   - 显示同步状态（✅ Synced / ⚠️ N files missing）
-   - "🔄 Rebuild Index" 按钮
+1. 在变更窗口内操作，记录旧发布目录、Nginx 配置、`CURRENT` 值和当前
+   generation ID。
+2. 确认 `.env` 可读，外部密钥和 Supabase 认证配置齐全。
+3. 使用短命校验进程检查完整 generation：
 
-2. **JavaScript 功能**（`admin.js`）：
-   - `refreshIndexStatus()` - 刷新索引状态
-   - `rebuildIndex()` - 手动触发索引重建
-   - SSE 事件处理增强（索引完成后自动刷新状态）
+   ```bash
+   .venv/bin/python -m nutrimaster.rag.index_builder_cli verify-active
+   ```
 
-3. **Upload 面板提示**（`admin.js`）：
-   - ZIP 上传成功后提示用户运行 Pipeline
-   - 说明索引会自动更新
+4. 检查 RAM、swap 和磁盘，但不要用“当前空闲看起来足够”代替 builder 预检：
 
-4. **样式改进**（`style.css`）：
-   - 索引状态卡片样式
-   - 状态徽章样式（success/warning/error/info）
+   ```bash
+   free -h
+   df -h /root/code/nutrimaster/data/index
+   ```
 
-### CLI 工具
+当前 103,024 chunks 的完整 generation 约 3.1 GiB。builder 在开始写入前会按实际
+语料计算“完整新 generation + 两份 dense workspace + 稳定 corpus snapshot +
+1 GiB 安全余量”；该语料当前需要额外约 5.833 GiB。数字会随语料变化，
+以每次预检结果为准。
 
-1. **`rebuild_index_robust.py`**：
-   - 无缓冲输出，实时查看进度
-   - 详细的状态信息和时间戳
-   - 适合后台运行
+生产必须保护 `CURRENT` 和上一代可回滚 generation。保留两代后磁盘余量会
+明显变窄；如果预检拒绝新构建，不得删除这两代中任何一代强行通过。
+应扩容，或经运维明确批准后将更旧的已验证备份移出本机。
 
-2. **`test_index_api.py`**：
-   - 测试 API 端点是否正常工作
-   - 显示索引状态
+## systemd 安装与资源边界
 
-3. **`check_index_status.py`**：
-   - 快速检查索引状态
-   - 估算重建时间
-
-## 部署步骤
-
-### 1. 等待当前索引重建完成
-
-```bash
-# 查看进度
-tail -f rebuild_robust.log
-
-# 或检查进程状态
-ps aux | grep rebuild_index_robust
-```
-
-**预计完成时间**：约 2 小时（从 23:11 开始，预计 01:11 完成）
-
-### 2. 重启 Flask 应用
+将 `deploy/systemd/` 中的 `nutrimaster.slice`、unified、Pi、builder service 和
+builder path unit 作为同一组发布。仔细核对 unit 中的工作目录和脚本路径后：
 
 ```bash
-# 找到 Flask 进程
-ps aux | grep "python.*app.py\|flask run\|gunicorn"
-
-# 重启应用（具体命令取决于你的部署方式）
-# 如果使用 systemd:
-sudo systemctl restart nutrimaster
-
-# 如果使用 supervisor:
-supervisorctl restart nutrimaster
-
-# 如果是开发模式直接运行:
-# 先 Ctrl+C 停止，然后重新运行
-python -m nutrimaster.web.app
+systemctl daemon-reload
+systemctl enable --now nutrimaster-index-builder.path nutrimaster-pi.service
 ```
 
-### 3. 验证 API 端点
+此时先不要直接启动 unified。记录并停止已确认归属的旧 `5000`/`5002`
+服务，确认两个端口均关闭后，再执行：
 
 ```bash
-# 测试索引状态 API
-python3 test_index_api.py
-
-# 或使用 curl（需要认证 token）
-curl http://localhost:8000/admin/api/index/status
+systemctl enable --now nutrimaster-unified.service
 ```
 
-**预期输出**：
-```json
-{
-  "total_files": 18181,
-  "indexed_files": 18181,
-  "missing_files": 0,
-  "total_chunks": 134661,
-  "embedding_shape": [134661, 1024],
-  "last_updated": "2026-05-09T01:11:00",
-  "is_synced": true
-}
-```
+启动脚本会在加载索引前检查这两个监听端口；任一仍被占用或无法执行检查时
+都会 fail closed，避免新旧 Python 在端口绑定失败前短暂重复加载索引。
 
-### 4. 测试 Admin Panel
-
-1. **访问 Dashboard**：
-   - 打开浏览器访问 `http://localhost:8000/admin`
-   - 登录后查看 Dashboard
-
-2. **检查索引状态卡片**：
-   - 应该显示 "Indexed Files: 18,181 / 18,181"
-   - 状态显示 "✅ Synced"
-
-3. **测试手动重建**（可选）：
-   - 点击 "🔄 Rebuild Index" 按钮
-   - 确认对话框
-   - 观察是否有错误提示
-
-### 5. 端到端测试
-
-**测试场景 1：上传 ZIP → Pipeline → 自动索引**
+生产主机是 systemd 239 + cgroup v1。必须检查生效值，不能只看 unit 文本：
 
 ```bash
-# 1. 准备一个包含 1-2 个 .md 文件的测试 ZIP
-# 2. 在 Admin Panel 上传 ZIP
-# 3. 切换到 Pipeline 标签，点击 "Run All"
-# 4. 观察 Pipeline log，应该看到：
-#    - 论文处理进度
-#    - 每篇论文处理完后的索引更新（静默，不会显示）
-#    - Pipeline 结束时的索引重建消息：
-#      "🔄 Rebuilding RAG index..."
-#      "✅ RAG index rebuilt successfully"
-# 5. 切换回 Dashboard，检查索引状态是否更新
+systemctl show nutrimaster-unified.service nutrimaster-pi.service \
+  nutrimaster-index-builder.service -p Slice -p MemoryLimit
+cat /sys/fs/cgroup/memory/nutrimaster.slice/memory.limit_in_bytes
 ```
 
-**测试场景 2：中途停止 Pipeline**
+期望硬限制为 unified 3 GiB、Pi 768 MiB、builder 2560 MiB，共享 slice
+5632 MiB。cgroup v1 上 `MemoryHigh` 和 `MemorySwapMax` 不是有效的服务级控制；
+该生产主机存在 swap，不得声称单元已将 swap 强制禁用。
+
+## 索引构建与激活
+
+Admin 上传后的 Pipeline、单篇预览或手动 Rebuild 只向
+`RAG_INDEX_DIR/builder-state/jobs/pending/` 原子写入任务。手动 Rebuild
+接口返回 HTTP `202` / `queued`；单篇和 Pipeline 通过响应/SSE 返回 job ID。
+这些信号都只表示持久化排队成功，不表示索引已构建或已生效。
+
+builder 持有全局排他锁，串行执行：
+
+1. 磁盘预检和稳定语料快照；
+2. 构建 dense、紧凑 BM25、字段关键词 FTS 和 Graph 全套产物；
+3. 校验 checksum、shape、corpus fingerprint 和 SQLite 完整性；
+4. 发布不可变 generation，原子切换 `CURRENT`；
+5. 受控重启 unified，并等待 `/api/health` 报告精确 generation ID；
+6. 激活失败时自动切回旧 `CURRENT`、重启并验证回滚 generation。
+
+独立查看 durable 状态：
 
 ```bash
-# 1. 上传包含多个文件的 ZIP
-# 2. 运行 Pipeline
-# 3. 处理几篇论文后点击 "Stop"
-# 4. 观察 log，应该看到索引重建消息
-# 5. 检查 Dashboard，已处理的文件应该都已索引
+.venv/bin/python -m nutrimaster.rag.index_builder_cli status
+journalctl -u nutrimaster-index-builder.service -n 200 --no-pager
 ```
 
-**测试场景 3：手动拷贝文件后手动重建**
+严禁下列生产做法：
+
+- 在 Web 环境中开启 build-on-start/build-on-miss/online reindex；
+- Pipeline 每处理一篇就直接更新全局索引；
+- 直接运行 `rebuild_index_robust.py`、`build_sparse_indexes` 或 Graph CLI 修改
+  正在服务的索引目录；
+- 用 cron/nohup/tmux 绕过 durable queue 和 systemd 内存限制；
+- builder 运行时另启第二个 builder。
+
+## 切流顺序
+
+1. 离线确认 active generation 完整，启动并验证 Pi `8787`；记录旧 `5000`/`5002`
+   的进程和单元归属，然后停止并禁用它们，确认两个监听端口均已关闭。
+2. 启动新的 unified `5000`，确认 `/api/health` 报告预期 generation；若失败，
+   在保持单 Python 约束的前提下按预留发布目录回滚。
+3. 使用真实用户 token 验证 `/api/query` 和 `/api/pi/query` SSE，再验证个人库、
+   Admin、CRISPR 和 gene-transfer 主要链路。
+4. 将 Nginx 切换为 `deploy/nginx/nutrimaster-unified.conf`，先执行 `nginx -t`，
+   再 reload。两个 SSE 路由都应指向同一 `127.0.0.1:5000` upstream；
+   `/api/pi/internal/*` 必须在公网代理边界返回 404。
+5. 小流量观察认证失败率、SSE 中断、500/502、延迟、unified/Pi RSS 和 cgroup 内存，
+   并再次确认只有 `5000` 和 `8787` 监听。
 
 ```bash
-# 1. 直接拷贝一个 JSON 文件到 data/corpus/
-cp some_paper_nutri_plant_verified.json data/corpus/
-
-# 2. 访问 Dashboard，应该显示 "⚠️ 1 files missing"
-# 3. 点击 "🔄 Rebuild Index"
-# 4. 等待几秒，刷新页面
-# 5. 状态应该变为 "✅ Synced"
+ss -ltnp | rg ':(5000|5002|8787)\b'
+curl --fail --silent http://127.0.0.1:5000/api/health
+curl --fail --silent http://127.0.0.1:8787/healthz
 ```
 
-## 监控和维护
+## 回滚
 
-### 日常检查
+- 索引激活失败由 builder 自动回滚。不要手工删除 generation，也不要
+  在受控 restart 仍处于 `deactivating` 的排空窗口内再次 kill。
+- 应用发布回滚使用切流前保留的已验证发布目录和 Nginx 配置，但仍必须
+  遵守单 FastAPI `5000` + Node `8787` 边界，不得通过恢复常驻 `5002`
+  来回滚。
+- 回滚后重跑认证后 E2E，并检查 active generation ID 和端口所有者。
 
-访问 Admin Panel Dashboard，查看索引状态卡片：
-- ✅ Synced - 一切正常
-- ⚠️ N files missing - 需要手动重建索引
-
-### 定期维护（可选）
-
-设置 cron 任务，每天自动检查和修复索引：
-
-```bash
-# 编辑 crontab
-crontab -e
-
-# 添加任务（每天凌晨 3 点运行）
-0 3 * * * cd /data/haotianwu/biojson && python3 rebuild_index_robust.py >> /var/log/index_rebuild.log 2>&1
-```
-
-### 故障排查
-
-**问题 1：Dashboard 不显示索引状态卡片**
-
-```bash
-# 检查 Flask 应用是否重启
-ps aux | grep flask
-
-# 检查浏览器控制台是否有 JavaScript 错误
-# 检查 /api/index/status 是否返回 200
-curl http://localhost:8000/admin/api/index/status
-```
-
-**问题 2：索引状态显示缺失文件**
-
-```bash
-# 方法 1：通过 Admin Panel 手动重建
-# 点击 Dashboard 的 "🔄 Rebuild Index" 按钮
-
-# 方法 2：通过 CLI 脚本重建
-python3 rebuild_index_robust.py
-
-# 方法 3：检查是否有文件损坏
-python3 check_index_status.py
-```
-
-**问题 3：索引重建失败**
-
-```bash
-# 检查错误日志
-tail -100 rebuild_robust.log
-
-# 常见原因：
-# - Jina API key 过期或无效
-# - 网络连接问题
-# - 磁盘空间不足
-
-# 检查 Jina API key
-echo $JINA_API_KEY
-
-# 检查磁盘空间
-df -h data/index/
-```
-
-## 性能优化（可选）
-
-如果觉得实时索引更新太慢，可以改为批量更新：
-
-**修改 `app.py` 中的 `_on_paper_done()` 函数**：
-
-```python
-# 每 10 篇或最后一篇时更新
-if status == "success" and (done % 10 == 0 or done == total):
-    try:
-        _refresh_index(DATA_DIR, force=False)
-    except Exception as e:
-        print(f"⚠️ 索引更新失败: {e}")
-```
-
-**权衡**：
-- 优点：减少 API 调用次数，提高 Pipeline 速度
-- 缺点：中途停止时可能有最多 9 篇论文未索引（会在结束时兜底更新）
-
-## 回滚方案
-
-如果新版本有问题，可以回滚到之前的版本：
-
-```bash
-# 1. 恢复旧版本的文件
-git checkout HEAD~1 src/nutrimaster/web/admin/app.py
-git checkout HEAD~1 src/nutrimaster/web/admin/static/
-git checkout HEAD~1 src/nutrimaster/rag/gene_index.py
-
-# 2. 重启 Flask 应用
-
-# 3. 索引仍然可以通过 CLI 脚本手动更新
-python3 rebuild_index_robust.py
-```
-
-## 下一步改进（P2 优先级）
-
-1. **进度条可视化**：
-   - 在 Pipeline log 中显示索引重建进度
-   - 需要修改 `_refresh_index()` 添加进度回调
-
-2. **索引健康检查端点**：
-   - `/api/index/health` - 返回详细的健康报告
-   - 包括缺失文件列表、建议操作等
-
-3. **自动重试机制**：
-   - 索引更新失败时自动重试 3 次
-   - 指数退避策略
-
-4. **索引重建历史**：
-   - 记录每次重建的时间、文件数、耗时
-   - 在 Dashboard 显示历史记录
-
-## 总结
-
-✅ **完全鲁棒**：四层防护机制，确保不会遗漏任何文件
-✅ **实时同步**：每篇论文处理完立即索引
-✅ **可监控**：Dashboard 实时显示索引健康状态
-✅ **可恢复**：多种方式手动修复索引
-✅ **易部署**：只需重启 Flask 应用即可生效
-
-**关键文件**：
-- `src/nutrimaster/web/admin/app.py` - 后端逻辑
-- `src/nutrimaster/web/admin/static/admin.js` - 前端逻辑
-- `src/nutrimaster/web/admin/static/index.html` - 界面
-- `src/nutrimaster/web/admin/static/style.css` - 样式
-- `src/nutrimaster/rag/gene_index.py` - 索引核心逻辑
-- `rebuild_index_robust.py` - CLI 重建脚本
+更详细的 builder 恢复、保留和状态语义见
+[`docs/index_builder_operations.md`](docs/index_builder_operations.md)；Pi 边界和 SSE 合约见
+[`docs/pi_runtime_migration.md`](docs/pi_runtime_migration.md)。

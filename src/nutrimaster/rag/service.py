@@ -28,6 +28,7 @@ class RAGSearchContext:
         top_k: 最终返回的最大结果数。
         pubmed_query: 用于 PubMed 的自定义查询（为空则使用主查询）。
         gene_db_query: 用于基因库的自定义查询（为空则使用主查询）。
+        gene_db_keyword_spec: Agent 生成的字段关键词检索规格，用于本地基因库精确补召回。
     """
     user_id: str | None = None
     include_personal: bool = False
@@ -36,6 +37,7 @@ class RAGSearchContext:
     top_k: int = 10
     pubmed_query: str = ""
     gene_db_query: str = ""
+    gene_db_keyword_spec: Any | None = None
 
 
 class RAGSearchService:
@@ -108,7 +110,20 @@ class RAGSearchService:
             )
 
         keys = list(tasks)
-        results = await asyncio.gather(*tasks.values())
+        running = [asyncio.create_task(search) for search in tasks.values()]
+        try:
+            results = await asyncio.gather(*running)
+        except MemoryError:
+            # ``gather`` does not cancel siblings when one child raises. Stop
+            # PubMed/graph/personal work before propagating allocator pressure.
+            for task in running:
+                task.cancel()
+            for task in running:
+                try:
+                    await task
+                except BaseException:
+                    pass
+            raise
         results_by_source = dict(zip(keys, results))
         source_counts = {key: len(items) for key, items in results_by_source.items()}
         warnings = self._empty_source_warnings(source_counts)
@@ -178,7 +193,12 @@ class RAGSearchService:
                 user_id=context.user_id,
                 mode=context.mode,
                 focus=context.focus,
+                keyword_spec=context.gene_db_keyword_spec,
             )
+        except MemoryError:
+            # Do not treat allocator exhaustion as an empty source and continue
+            # into the remaining fusion/LLM stages.
+            raise
         except Exception as exc:
             logger.warning("%s search failed: %s: %r", source.__class__.__name__, type(exc).__name__, exc)
             return []
@@ -314,6 +334,8 @@ class PubMedSource:
                         "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
                     }
                 )
+            except MemoryError:
+                raise
             except Exception:
                 continue
         return results
@@ -332,7 +354,14 @@ class GeneDbSource:
         """
         self.retriever = retriever
 
-    async def search(self, query: str, *, top_k: int = 12, **_: Any) -> list[EvidenceItem]:
+    async def search(
+        self,
+        query: str,
+        *,
+        top_k: int = 12,
+        keyword_spec: Any | None = None,
+        **_: Any,
+    ) -> list[EvidenceItem]:
         """在本地基因数据库中搜索与查询相关的基因信息。
 
         优先使用混合搜索（hybrid_search），若不可用则回退到普通搜索。
@@ -349,12 +378,16 @@ class GeneDbSource:
         import inspect
 
         if hasattr(self.retriever, "hybrid_search"):
-            maybe_results = self.retriever.hybrid_search(
-                query,
-                top_k=top_k,
-                rerank=True,
-                rerank_top_n=max(top_k * 4, 50),
-            )
+            kwargs = {
+                "top_k": top_k,
+                "rerank": True,
+                "rerank_top_n": max(top_k * 4, 50),
+            }
+            signature = inspect.signature(self.retriever.hybrid_search)
+            accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+            if keyword_spec is not None and (accepts_kwargs or "keyword_spec" in signature.parameters):
+                kwargs["keyword_spec"] = keyword_spec
+            maybe_results = self.retriever.hybrid_search(query, **kwargs)
             results = await maybe_results if inspect.isawaitable(maybe_results) else maybe_results
         else:
             results = await asyncio.to_thread(self.retriever.search, query, top_k=top_k)

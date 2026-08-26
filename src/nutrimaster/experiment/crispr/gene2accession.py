@@ -268,6 +268,8 @@ def run_gene2accession(genes: list[dict], work_dir: Path) -> list[Path]:
         normalized_species = _normalize_species_name(gene["species"])
         try:
             accession = _find_accession_for_gene(gene["gene"], gene["species"])
+        except MemoryError:
+            raise
         except Exception as exc:
             logger.warning("Gene %s accession lookup failed: %s", gene["gene"], exc)
             accession = ""

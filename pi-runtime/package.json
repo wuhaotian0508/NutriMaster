@@ -1,0 +1,22 @@
+{
+  "name": "nutrimaster-pi-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi runtime boundary for NutriMaster",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "demo:plugin": "node examples/simple-agent-plugin/agent.js",
+    "check": "node --check src/server.js && node --check src/runtime.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "dotenv": "16.6.1",
+    "typebox": "1.1.38"
+  }
+}

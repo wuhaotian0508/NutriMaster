@@ -293,6 +293,11 @@ class Agent:
                     yield {"type": "tool_call", "tool": tool_name, "args": args}
                     try:
                         result = await self.registry.execute(tool_name, **args)
+                    except MemoryError:
+                        # Exhaustion is a process-safety condition. Continuing
+                        # the agent loop would allocate tool text, context and
+                        # another model request while memory is unavailable.
+                        raise
                     except Exception as exc:
                         result = f"工具执行失败: {exc}"
                     if isinstance(result, EvidencePacket):
@@ -342,9 +347,15 @@ class Agent:
                     species = await asyncio.to_thread(extract_transgenic_species_with_llm, full_text)
                     if species:
                         yield {"type": "species_available", "species": species}
+                except MemoryError:
+                    raise
                 except Exception:
                     pass
             yield {"type": "done"}
+        except MemoryError:
+            # Let the serving boundary abort the request without constructing
+            # an additional error event or traceback-sized log record.
+            raise
         except Exception as exc:
             logger.exception("Agent run failed")
             yield {"type": "error", "data": str(exc)}

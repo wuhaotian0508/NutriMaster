@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from nutrimaster.experiment.resource_limits import (
+    ExperimentResourceLimitError,
+    MAX_CUMULATIVE_SOP_CHARS,
+    SOPOutputBudget,
+)
+
 
 def format_sops(sops: dict[str, str]) -> str:
     """将 SOP 字典格式化为 Markdown 文本。
@@ -13,4 +19,18 @@ def format_sops(sops: dict[str, str]) -> str:
     Returns:
         str: 格式化后的 Markdown 文本，每个 SOP 以 "## {species}" 为标题。
     """
-    return "\n\n".join(f"## {species}\n{sop}" for species, sop in sops.items())
+    budget = SOPOutputBudget()
+    parts: list[str] = []
+    formatting_chars = 0
+    for index, (species, sop) in enumerate(sops.items()):
+        budget.consume(sop, label=str(species))
+        heading = f"## {species}\n"
+        separator = "\n\n" if index else ""
+        formatting_chars += len(separator) + len(heading)
+        if formatting_chars > MAX_CUMULATIVE_SOP_CHARS - budget.used:
+            raise ExperimentResourceLimitError(
+                "formatted SOP output exceeds the hard cumulative limit of "
+                f"{MAX_CUMULATIVE_SOP_CHARS} characters"
+            )
+        parts.extend((separator, heading, sop))
+    return "".join(parts)

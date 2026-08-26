@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -8,9 +10,91 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from nutrimaster.auth.service import get_current_user
 from nutrimaster.rag.evidence import extract_graph_evidence
 from nutrimaster.web.deps import SSE_HEADERS, WebServices, get_services, sse
+from nutrimaster.web.request_limits import read_bounded_json_object
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+_MAX_JSON_BODY_BYTES = 1024 * 1024
+_MAX_QUERY_CHARS = 16_000
+_MAX_AUX_QUERY_CHARS = 8_000
+_MAX_HISTORY_MESSAGES = 50
+_MAX_HISTORY_TEXT_CHARS = 100_000
+_DEFAULT_RAG_TOP_K = 10
+_MAX_RAG_TOP_K = 50
+
+
+def _required_query_text(
+    data: dict[str, Any],
+    *,
+    max_chars: int = _MAX_QUERY_CHARS,
+    empty_detail: str = "查询不能为空",
+) -> str:
+    value = data.get("query")
+    if value is None:
+        raise HTTPException(status_code=400, detail=empty_detail)
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="query 必须是字符串")
+    value = value.strip()
+    if not value:
+        raise HTTPException(status_code=400, detail=empty_detail)
+    if len(value) > max_chars:
+        raise HTTPException(status_code=400, detail=f"query 不能超过 {max_chars} 个字符")
+    return value
+
+
+def _optional_query_text(data: dict[str, Any], key: str, *, max_chars: int) -> str:
+    value = data.get(key, "")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail=f"{key} 必须是字符串")
+    if len(value) > max_chars:
+        raise HTTPException(status_code=400, detail=f"{key} 不能超过 {max_chars} 个字符")
+    return value
+
+
+def _validated_history(data: dict[str, Any]) -> list[dict[str, Any]]:
+    history = data.get("history", [])
+    if history is None:
+        return []
+    if not isinstance(history, list):
+        raise HTTPException(status_code=400, detail="history 必须是数组")
+    if len(history) > _MAX_HISTORY_MESSAGES:
+        raise HTTPException(status_code=400, detail="history 最多包含 50 条消息")
+
+    text_chars = 0
+    for item in history:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="history 每一项必须是对象")
+        if not isinstance(item.get("role"), str):
+            raise HTTPException(status_code=400, detail="history role 必须是字符串")
+        content = item.get("content")
+        if not isinstance(content, str):
+            raise HTTPException(status_code=400, detail="history content 必须是字符串")
+        text_chars += len(content)
+        if text_chars > _MAX_HISTORY_TEXT_CHARS:
+            raise HTTPException(status_code=400, detail="history 文本总量不能超过 100000 个字符")
+    return history
+
+
+def _rag_top_k(data: dict[str, Any]) -> int:
+    if "top_k" not in data:
+        return _DEFAULT_RAG_TOP_K
+    value = data["top_k"]
+    if isinstance(value, bool):
+        raise HTTPException(status_code=400, detail="top_k 必须是 1 到 50 之间的整数")
+    if isinstance(value, int):
+        top_k = value
+    elif isinstance(value, str):
+        try:
+            top_k = int(value.strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="top_k 必须是 1 到 50 之间的整数") from None
+    else:
+        raise HTTPException(status_code=400, detail="top_k 必须是 1 到 50 之间的整数")
+    if not 1 <= top_k <= _MAX_RAG_TOP_K:
+        raise HTTPException(status_code=400, detail="top_k 必须是 1 到 50 之间的整数")
+    return top_k
 
 
 @router.post("/api/query")
@@ -45,11 +129,9 @@ async def query(
     异常:
         HTTPException: 查询为空时返回 400。
     """
-    data = await request.json()
-    query_text = (data.get("query") or "").strip()
-    if not query_text:
-        raise HTTPException(status_code=400, detail="查询不能为空")
-    history = data.get("history", []) or []
+    data = await read_bounded_json_object(request, max_bytes=_MAX_JSON_BODY_BYTES)
+    query_text = _required_query_text(data)
+    history = _validated_history(data)
     use_personal = data.get("use_personal", False)
     use_depth = data.get("use_depth", False)
     model_id = data.get("model_id", "")
@@ -111,6 +193,14 @@ async def query(
                 if event.get("type") == "error":
                     status = "error"
                 yield sse(event)
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        except MemoryError:
+            # Avoid allocating/logging a synthetic SSE event while the process
+            # is already under allocator pressure.
+            status = "error"
+            raise
         except Exception as exc:
             logger.exception("[/api/query] failed")
             status = "error"
@@ -152,7 +242,7 @@ async def feedback(
     异常:
         HTTPException: interaction_id 为空（400）或 rating 值无效（400）。
     """
-    data = await request.json()
+    data = await read_bounded_json_object(request, max_bytes=_MAX_JSON_BODY_BYTES)
     interaction_id = (data.get("interaction_id") or "").strip()
     rating = (data.get("rating") or "").strip().lower()
     if not interaction_id:
@@ -202,21 +292,22 @@ async def rag_search_debug(
     异常:
         HTTPException: query 为空（400）或 rag_search 工具未注册（500）。
     """
-    data = await request.json()
-    query_text = (data.get("query") or "").strip()
-    if not query_text:
-        raise HTTPException(status_code=400, detail="query 不能为空")
+    data = await read_bounded_json_object(request, max_bytes=_MAX_JSON_BODY_BYTES)
+    query_text = _required_query_text(data, empty_detail="query 不能为空")
+    pubmed_query = _optional_query_text(data, "pubmed_query", max_chars=_MAX_AUX_QUERY_CHARS)
+    gene_db_query = _optional_query_text(data, "gene_db_query", max_chars=_MAX_AUX_QUERY_CHARS)
+    top_k = _rag_top_k(data)
     rag_tool = services.registry.get("rag_search")
     if rag_tool is None:
         raise HTTPException(status_code=500, detail="rag_search 未注册")
     packet = await rag_tool.execute(
         query=query_text,
-        pubmed_query=data.get("pubmed_query") or "",
-        gene_db_query=data.get("gene_db_query") or "",
+        pubmed_query=pubmed_query,
+        gene_db_query=gene_db_query,
         mode=data.get("mode") or ("deep" if data.get("use_depth") else "normal"),
         include_personal=bool(data.get("include_personal") or data.get("use_personal")),
         focus=data.get("focus") or "general",
-        top_k=int(data.get("top_k") or 10),
+        top_k=top_k,
         user_id=user.id,
     )
     return JSONResponse(

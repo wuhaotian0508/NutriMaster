@@ -3,11 +3,167 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+from contextlib import contextmanager
+from collections.abc import Iterator
 from typing import Any, AsyncGenerator
 
-from nutrimaster.experiment.crispr import run_crispr_workflow, stream_crispr_workflow
-from nutrimaster.experiment.gene_validation import extract_transgenic_species_with_llm, verify_genes_with_ncbi
+from nutrimaster.experiment.crispr import stream_crispr_workflow
+from nutrimaster.experiment.gene_validation import (
+    extract_transgenic_species_with_llm,
+    verify_genes_with_ncbi,
+)
 from nutrimaster.experiment.sop import format_sops
+from nutrimaster.experiment.resource_limits import validate_sop_output
+
+
+MAX_EXPERIMENT_GOAL_CHARS = 16_000
+MAX_EXPERIMENT_GENES = 50
+MAX_SELECTED_GENE_NAMES = 50
+MAX_RECIPIENT_SPECIES = 20
+MAX_GENE_NAME_CHARS = 128
+MAX_SPECIES_NAME_CHARS = 256
+_EVENT_QUEUE_CAPACITY = 16
+
+
+class ExperimentInputError(ValueError):
+    """Raised when an experiment request exceeds its safe input contract."""
+
+
+class ExperimentBusyError(RuntimeError):
+    """Raised when another memory-sensitive experiment job is still active."""
+
+
+class ExperimentExecutionGate:
+    """Fail-fast process-local gate shared by every online experiment service.
+
+    The synchronous experiment workers cannot be cancelled by cancelling their
+    owning coroutine.  A threading lock therefore guards the real worker
+    lifetime, including the period after an SSE client disconnects.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            raise ExperimentBusyError("实验服务正忙，请等待当前任务完成后重试")
+
+    def release(self) -> None:
+        self._lock.release()
+
+    @contextmanager
+    def hold(self) -> Iterator[None]:
+        self.try_acquire()
+        try:
+            yield
+        finally:
+            self.release()
+
+
+def _normalize_bounded_text(
+    value: Any,
+    *,
+    field: str,
+    max_chars: int,
+    allow_empty: bool = False,
+) -> str:
+    if not isinstance(value, str):
+        raise ExperimentInputError(f"{field} 必须是字符串")
+    if len(value) > max_chars:
+        raise ExperimentInputError(f"{field} 过长，最多 {max_chars} 个字符")
+    normalized = value.strip()
+    if not allow_empty and not normalized:
+        raise ExperimentInputError(f"{field} 不能为空")
+    return normalized
+
+
+def normalize_experiment_goal(value: Any, *, allow_empty: bool = False) -> str:
+    """Validate and trim one experiment goal before it reaches an LLM prompt."""
+    return _normalize_bounded_text(
+        value,
+        field="goal",
+        max_chars=MAX_EXPERIMENT_GOAL_CHARS,
+        allow_empty=allow_empty,
+    )
+
+
+def normalize_selected_gene_names(value: Any) -> list[str] | None:
+    """Validate the optional user-selected gene-name list."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ExperimentInputError("selected_gene_names 必须是数组")
+    if len(value) > MAX_SELECTED_GENE_NAMES:
+        raise ExperimentInputError(
+            f"selected_gene_names 最多包含 {MAX_SELECTED_GENE_NAMES} 项"
+        )
+    return [
+        _normalize_bounded_text(
+            item,
+            field=f"selected_gene_names[{index}]",
+            max_chars=MAX_GENE_NAME_CHARS,
+        )
+        for index, item in enumerate(value)
+    ]
+
+
+def normalize_experiment_genes(
+    value: Any,
+    *,
+    allow_none: bool = False,
+    require_nonempty: bool = False,
+    require_species: bool = True,
+) -> list[dict[str, str]] | None:
+    """Validate and reduce gene records to the fields consumed by workflows."""
+    if value is None:
+        if allow_none:
+            return None
+        raise ExperimentInputError("genes 必须是数组")
+    if not isinstance(value, list):
+        raise ExperimentInputError("genes 必须是数组")
+    if require_nonempty and not value:
+        raise ExperimentInputError("genes 不能为空")
+    if len(value) > MAX_EXPERIMENT_GENES:
+        raise ExperimentInputError(f"genes 最多包含 {MAX_EXPERIMENT_GENES} 项")
+
+    normalized: list[dict[str, str]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ExperimentInputError(f"genes[{index}] 必须是对象")
+        gene = _normalize_bounded_text(
+            item.get("gene"),
+            field=f"genes[{index}].gene",
+            max_chars=MAX_GENE_NAME_CHARS,
+        )
+        species_value = item.get("species", "")
+        species = _normalize_bounded_text(
+            species_value,
+            field=f"genes[{index}].species",
+            max_chars=MAX_SPECIES_NAME_CHARS,
+            allow_empty=not require_species,
+        )
+        normalized.append({"gene": gene, "species": species})
+    return normalized
+
+
+def normalize_recipient_species(value: Any) -> list[str]:
+    """Validate a non-empty list of gene-transfer recipient species."""
+    if not isinstance(value, list):
+        raise ExperimentInputError("species_list 必须是数组")
+    if not value:
+        raise ExperimentInputError("species_list 不能为空")
+    if len(value) > MAX_RECIPIENT_SPECIES:
+        raise ExperimentInputError(
+            f"species_list 最多包含 {MAX_RECIPIENT_SPECIES} 项"
+        )
+    return [
+        _normalize_bounded_text(
+            item,
+            field=f"species_list[{index}]",
+            max_chars=MAX_SPECIES_NAME_CHARS,
+        )
+        for index, item in enumerate(value)
+    ]
 
 
 class ExperimentDesignService:
@@ -17,7 +173,7 @@ class ExperimentDesignService:
     将基因提取、NCBI 验证和 SOP 生成等步骤整合为统一的工作流。
     """
 
-    def __init__(self, pipeline_factory=None):
+    def __init__(self, pipeline_factory=None, *, execution_gate: ExperimentExecutionGate | None = None):
         """初始化实验设计服务。
 
         Args:
@@ -25,6 +181,7 @@ class ExperimentDesignService:
                 若为 None，则使用默认的 ExperimentPipeline 构造。
         """
         self.pipeline_factory = pipeline_factory
+        self.execution_gate = execution_gate or ExperimentExecutionGate()
 
     async def preview(
         self,
@@ -50,21 +207,41 @@ class ExperimentDesignService:
         Returns:
             list[dict[str, Any]]: 经 NCBI 验证后的基因信息列表。
         """
-        pipeline = self._create_pipeline()
-        try:
-            if genes:
-                extracted = genes
-            elif selected_gene_names:
-                extracted = await asyncio.to_thread(
-                    pipeline.extract_selected_genes_with_llm,
-                    goal,
-                    selected_gene_names,
-                )
-            else:
-                extracted = await asyncio.to_thread(pipeline.extract_genes_with_llm, goal)
-            return await asyncio.to_thread(verify_genes_with_ncbi, extracted)
-        finally:
-            pipeline.cleanup()
+        goal = normalize_experiment_goal(goal, allow_empty=bool(genes))
+        genes = normalize_experiment_genes(
+            genes,
+            allow_none=True,
+            require_species=False,
+        )
+        selected_gene_names = normalize_selected_gene_names(selected_gene_names)
+        def _preview_sync() -> list[dict[str, Any]]:
+            # Acquire inside the worker. Cancelling ``asyncio.to_thread`` does
+            # not stop that worker, so the gate must outlive the coroutine.
+            with self.execution_gate.hold():
+                pipeline = self._create_pipeline()
+                try:
+                    if genes:
+                        extracted = genes
+                    elif selected_gene_names:
+                        extracted = pipeline.extract_selected_genes_with_llm(
+                            goal,
+                            selected_gene_names,
+                        )
+                    else:
+                        extracted = pipeline.extract_genes_with_llm(goal)
+                    extracted = normalize_experiment_genes(
+                        extracted,
+                        require_nonempty=True,
+                        # CRISPR preview has always allowed a known gene without a
+                        # species; NCBI verification can return an unverified preview
+                        # and let the user supply the species before the run stage.
+                        require_species=False,
+                    )
+                    return verify_genes_with_ncbi(extracted)
+                finally:
+                    pipeline.cleanup()
+
+        return await asyncio.to_thread(_preview_sync)
 
     async def run(self, *, genes: list[dict[str, Any]]) -> AsyncGenerator[dict, None]:
         """流式运行完整的 CRISPR 实验设计工作流，逐步 yield progress/result/error 事件。
@@ -77,29 +254,113 @@ class ExperimentDesignService:
         Yields:
             dict: pipeline 产生的事件（type: progress / result / error）。
         """
-        pipeline = self._create_pipeline()
-        q: queue.Queue = queue.Queue()
-        _SENTINEL = object()
+        genes = normalize_experiment_genes(
+            genes,
+            require_nonempty=True,
+            require_species=True,
+        )
+        assert genes is not None
+        self.execution_gate.try_acquire()
+        gate_owned_by_caller = True
+        try:
+            pipeline = self._create_pipeline()
+        except BaseException:
+            self.execution_gate.release()
+            raise
+        q: queue.Queue[Any] = queue.Queue(maxsize=_EVENT_QUEUE_CAPACITY)
+        stop_event = threading.Event()
+        sentinel = object()
+
+        def _enqueue(item: Any) -> bool:
+            while not stop_event.is_set():
+                try:
+                    q.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _dequeue() -> Any:
+            while not stop_event.is_set():
+                try:
+                    return q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+            return sentinel
 
         def _run_in_thread():
+            memory_error: MemoryError | None = None
+            ordinary_error: Exception | None = None
             try:
                 for event in stream_crispr_workflow(pipeline, genes):
-                    q.put(event)
+                    if event.get("type") == "result":
+                        validate_sop_output(event.get("sops", {}))
+                    if not _enqueue(event):
+                        return
+            except MemoryError as exc:
+                memory_error = exc
             except Exception as exc:
-                q.put({"type": "error", "msg": str(exc)})
+                ordinary_error = exc
             finally:
-                pipeline.cleanup()
-                q.put(_SENTINEL)
+                try:
+                    try:
+                        pipeline.cleanup()
+                    except MemoryError as exc:
+                        if memory_error is None:
+                            memory_error = exc
+                    except Exception as exc:
+                        if ordinary_error is None:
+                            ordinary_error = exc
 
-        loop = asyncio.get_event_loop()
+                    terminal_item: Any = memory_error
+                    if terminal_item is None and ordinary_error is not None:
+                        try:
+                            terminal_item = {
+                                "type": "error",
+                                "msg": str(ordinary_error),
+                            }
+                        except MemoryError as exc:
+                            terminal_item = exc
+                    if terminal_item is not None:
+                        _enqueue(terminal_item)
+                    _enqueue(sentinel)
+                finally:
+                    # The coroutine may already be cancelled, but this worker
+                    # can still hold downloaded sequences and SOP buffers.
+                    self.execution_gate.release()
+
         thread = threading.Thread(target=_run_in_thread, daemon=True)
-        thread.start()
+        try:
+            thread.start()
+            gate_owned_by_caller = False
+        except MemoryError:
+            try:
+                pipeline.cleanup()
+            except BaseException:
+                pass
+            self.execution_gate.release()
+            gate_owned_by_caller = False
+            raise
+        except BaseException:
+            try:
+                pipeline.cleanup()
+            finally:
+                self.execution_gate.release()
+                gate_owned_by_caller = False
+            raise
 
-        while True:
-            item = await loop.run_in_executor(None, q.get)
-            if item is _SENTINEL:
-                break
-            yield item
+        try:
+            while True:
+                item = await asyncio.to_thread(_dequeue)
+                if item is sentinel:
+                    break
+                if isinstance(item, MemoryError):
+                    raise item
+                yield item
+        finally:
+            stop_event.set()
+            if gate_owned_by_caller:
+                self.execution_gate.release()
 
     async def tool_call(
         self,
@@ -162,6 +423,9 @@ class GeneTransferDesignService:
     协调从 LLM 推断受体物种、获取基因序列到 SOP 模板填充的完整流程。
     """
 
+    def __init__(self, *, execution_gate: ExperimentExecutionGate | None = None):
+        self.execution_gate = execution_gate or ExperimentExecutionGate()
+
     async def preview_species(
         self,
         *,
@@ -179,22 +443,48 @@ class GeneTransferDesignService:
               - "genes": 验证后的基因列表
               - "species": LLM 推断的受体物种拉丁名列表
         """
-        pipeline = self._create_pipeline()
-        try:
-            if selected_gene_names:
-                genes = await asyncio.to_thread(
-                    pipeline.extract_selected_genes_with_llm,
-                    goal,
-                    selected_gene_names,
-                )
-            else:
-                genes = await asyncio.to_thread(pipeline.extract_genes_with_llm, goal)
+        goal = normalize_experiment_goal(goal)
+        selected_gene_names = normalize_selected_gene_names(selected_gene_names)
+        def _preview_sync() -> dict[str, Any]:
+            # See ExperimentDesignService.preview: the worker, rather than the
+            # cancellable coroutine, owns the capacity lease.
+            with self.execution_gate.hold():
+                pipeline = self._create_pipeline()
+                try:
+                    if selected_gene_names:
+                        genes = pipeline.extract_selected_genes_with_llm(
+                            goal,
+                            selected_gene_names,
+                        )
+                    else:
+                        genes = pipeline.extract_genes_with_llm(goal)
 
-            verified = await asyncio.to_thread(verify_genes_with_ncbi, genes)
-            species = await asyncio.to_thread(extract_transgenic_species_with_llm, goal)
-            return {"genes": verified, "species": species}
-        finally:
-            pipeline.cleanup()
+                    genes = normalize_experiment_genes(
+                        genes,
+                        require_nonempty=True,
+                        require_species=True,
+                    )
+                    verified = verify_genes_with_ncbi(genes)
+                    species = extract_transgenic_species_with_llm(goal)
+                    if not isinstance(species, list):
+                        raise ExperimentInputError("species 必须是数组")
+                    if len(species) > MAX_RECIPIENT_SPECIES:
+                        raise ExperimentInputError(
+                            f"species 最多包含 {MAX_RECIPIENT_SPECIES} 项"
+                        )
+                    species = [
+                        _normalize_bounded_text(
+                            item,
+                            field=f"species[{index}]",
+                            max_chars=MAX_SPECIES_NAME_CHARS,
+                        )
+                        for index, item in enumerate(species)
+                    ]
+                    return {"genes": verified, "species": species}
+                finally:
+                    pipeline.cleanup()
+
+        return await asyncio.to_thread(_preview_sync)
 
     async def run(
         self,
@@ -211,19 +501,31 @@ class GeneTransferDesignService:
         Returns:
             dict[str, str]: 以物种名为键、Markdown SOP 文本为值的字典。
         """
-        from nutrimaster.experiment.gene_transfer.gene2updown import run_gene_transfer_sequences
-        from nutrimaster.experiment.gene_transfer.experiment_design import run_gene_transfer_design
-
-        gene_results = await asyncio.to_thread(
-            run_gene_transfer_sequences,
+        genes = normalize_experiment_genes(
             genes,
+            require_nonempty=True,
+            require_species=True,
         )
-        sops = await asyncio.to_thread(
+        assert genes is not None
+        species_list = normalize_recipient_species(species_list)
+        from nutrimaster.experiment.gene_transfer.gene2updown import (
+            run_gene_transfer_sequences,
+        )
+        from nutrimaster.experiment.gene_transfer.experiment_design import (
             run_gene_transfer_design,
-            gene_results,
-            species_list,
         )
-        return sops
+
+        def _run_sync() -> dict[str, str]:
+            with self.execution_gate.hold():
+                gene_results = run_gene_transfer_sequences(genes)
+                sops = run_gene_transfer_design(
+                    gene_results,
+                    species_list,
+                )
+                validate_sop_output(sops)
+                return sops
+
+        return await asyncio.to_thread(_run_sync)
 
     def _create_pipeline(self):
         from nutrimaster.experiment.crispr.pipeline import ExperimentPipeline

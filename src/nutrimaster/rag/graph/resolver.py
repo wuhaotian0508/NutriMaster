@@ -163,6 +163,8 @@ class Neo4jNodeResolver:
         try:
             with self.store.session() as session:
                 rows = session.run(query, text=query_text, species=normalize_name(species), limit=limit).data()
+        except MemoryError:
+            raise
         except Exception:
             return []
         return [

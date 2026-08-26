@@ -17,11 +17,9 @@ import io
 import os
 import queue
 import threading
-import zipfile
 from collections.abc import Callable
 from datetime import datetime
 from functools import wraps
-from io import BytesIO
 from pathlib import Path
 
 from flask import Response, jsonify, request, send_from_directory
@@ -47,6 +45,13 @@ os.environ.setdefault("MD_DIR", str(EXTRACTION_ROOT / "input"))
 from dotenv import load_dotenv
 load_dotenv(REPO_ROOT / ".env")
 
+from nutrimaster.web.admin.upload import (
+    ZipUploadError,
+    ZipUploadLimitError,
+    ZipUploadStorageError,
+    extract_zip_upload,
+)
+
 # Supabase 客户端（用于服务端验证 token）
 from supabase import create_client
 
@@ -54,6 +59,7 @@ from supabase import create_client
 from nutrimaster.extraction.config import INPUT_DIR, ensure_dirs
 from nutrimaster.extraction.pipeline import process_one_paper, run_pipeline_batch, save_token_report
 from nutrimaster.extraction.token_tracker import TokenTracker
+from nutrimaster.experiment.service import ExperimentBusyError, ExperimentExecutionGate
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  Flask App 初始化                                                         ║
@@ -90,6 +96,8 @@ supabase = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    except MemoryError:
+        raise
     except Exception as e:
         print(f"⚠️  Supabase 初始化失败 ({e})，认证功能不可用")
 
@@ -98,16 +106,39 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 # ║  前端 Settings 面板可调，通过 POST body 传入                               ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
+
+def _pipeline_worker_env(name: str, default: int, *, maximum: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if not 1 <= value <= maximum:
+        raise RuntimeError(f"{name} must be between 1 and {maximum}")
+    return value
+
+
+_PIPELINE_MAX_WORKERS = _pipeline_worker_env(
+    "NUTRIMASTER_PIPELINE_MAX_WORKERS",
+    1,
+    maximum=1,
+)
+_PIPELINE_DEFAULT_WORKERS = _pipeline_worker_env(
+    "NUTRIMASTER_PIPELINE_DEFAULT_WORKERS",
+    1,
+    maximum=_PIPELINE_MAX_WORKERS,
+)
+
 PIPELINE_DEFAULTS = {
     "temperature": 0.7,          # 提取 API 的温度参数（0=确定性，1=创造性）
     "verify_batch_genes": 12,    # 每批验证多少个基因（越大单次 API 处理越多）
-    "max_workers": 32,           # 并行处理论文数（ThreadPoolExecutor 线程数）
+    "max_workers": _PIPELINE_DEFAULT_WORKERS,
 }
 
 PIPELINE_LIMITS = {
     "temperature":       (0.0, 1.0),
     "verify_batch_genes": (1, 50),
-    "max_workers":        (1, 64),    # 最大 64 并行
+    "max_workers":        (1, _PIPELINE_MAX_WORKERS),
 }
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -116,6 +147,10 @@ PIPELINE_LIMITS = {
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 _lock = threading.Lock()
+# Serialize the check-and-start section and synchronous preview execution.
+# ``pipeline_state['running']`` alone is not an atomic reservation: two WSGI
+# threads could both observe False before either starts a worker.
+_pipeline_execution_gate = ExperimentExecutionGate()
 pipeline_state = {
     "running": False,          # 是否有 pipeline 正在运行
     "stop_requested": False,   # 用户是否请求停止
@@ -129,15 +164,27 @@ pipeline_state = {
     "tracker": None,           # 当前运行的 TokenTracker 实例（供实时查询）
 }
 
-_index_refresh_handler: Callable[[Path, bool], None] | None = None
+_index_refresh_handler: Callable[[Path, bool], dict] | None = None
+_index_status_handler: Callable[[], dict] | None = None
+_index_build_status_handler: Callable[[], dict] | None = None
 
 
-def configure_index_refresh(handler: Callable[[Path, bool], None] | None) -> None:
-    """注入宿主应用的检索器索引刷新函数。
+def configure_pipeline_execution_gate(gate: ExperimentExecutionGate | None) -> None:
+    """Share the host's high-memory execution gate with Admin extraction.
 
-    独立运行的 admin 会回退到构建自己的检索器；
-    集成到 FastAPI 主应用时，会传入活跃的检索器实例，
-    使新添加的语料文件在索引重建后立即对当前查询流程可见。
+    Preview owns the lease synchronously. A batch transfers its lease to the
+    background worker so experiments remain excluded for the real worker
+    lifetime, not merely for the HTTP start request.
+    """
+    global _pipeline_execution_gate
+    _pipeline_execution_gate = gate or ExperimentExecutionGate()
+
+
+def configure_index_refresh(handler: Callable[[Path, bool], dict] | None) -> None:
+    """注入宿主应用的独立索引构建排队函数。
+
+    无论独立或集成运行，本模块都只提交持久化任务；它绝不会在
+    Web 进程中创建检索器或构建语料规模的索引。
 
     参数:
         handler: 索引刷新回调函数，接受 (data_dir: Path, force: bool) 两个参数。
@@ -147,24 +194,40 @@ def configure_index_refresh(handler: Callable[[Path, bool], None] | None) -> Non
     _index_refresh_handler = handler
 
 
-def _refresh_index(data_dir: Path, *, force: bool = False) -> None:
-    """刷新 RAG 向量检索索引。
+def configure_index_status(handler: Callable[[], dict] | None) -> None:
+    """Inject a status reader for the already-loaded canonical retriever."""
+    global _index_status_handler
+    _index_status_handler = handler
 
-    优先使用通过 configure_index_refresh 注入的处理器；
-    若未注入，则回退创建一个临时的 JinaRetriever 进行增量索引构建。
+
+def configure_index_build_status(handler: Callable[[], dict] | None) -> None:
+    """Inject the durable builder status reader owned by the host app."""
+
+    global _index_build_status_handler
+    _index_build_status_handler = handler
+
+
+def _refresh_index(data_dir: Path, *, force: bool = False) -> dict:
+    """Queue an index build in the isolated builder service.
+
+    A return value means the request is durably queued, not that a generation
+    has already been built or activated.
 
     参数:
         data_dir: 语料 JSON 文件所在目录路径。
         force: 是否强制重建索引（默认 False，仅增量更新）。
     """
     if _index_refresh_handler is not None:
-        _index_refresh_handler(Path(data_dir), force)
-        return
+        return _index_refresh_handler(Path(data_dir), force)
 
-    from nutrimaster.rag.jina import JinaRetriever
+    from nutrimaster.rag.index_build_jobs import IndexBuildQueue
 
-    fallback_retriever = JinaRetriever()
-    fallback_retriever.build_index(data_dir=data_dir, incremental=True, force=force)
+    if SETTINGS.rag is None or Path(data_dir).resolve() != SETTINGS.rag.data_dir.resolve():
+        raise RuntimeError("index builder only accepts the configured corpus directory")
+    return IndexBuildQueue.from_settings(SETTINGS).enqueue(
+        force=force,
+        reason="standalone-admin",
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -277,6 +340,8 @@ def login_required(f):
         try:
             resp = supabase.auth.get_user(token)
             request.user = resp.user
+        except MemoryError:
+            raise
         except Exception:
             return jsonify({"error": "认证失败，请重新登录"}), 401
         return f(*args, **kwargs)
@@ -482,56 +547,29 @@ def api_upload():
     processed_stems = get_processed_stems()
     existing_input = {Path(n).stem for n in get_input_files()}
 
-    new_files = []          # 新增到 input 的文件
-    skipped_processed = []  # 跳过：data 中已有
-    skipped_existing = []   # 跳过：input 中已有
-
-    def extract_recursive(buf: BytesIO):
-        """递归解压 ZIP 文件，提取所有 Markdown 文件。
-
-        遇到嵌套的 ZIP 文件会继续递归解压，直到提取出所有 .md 文件。
-        自动跳过 macOS 元数据目录（__MACOSX）和目录条目。
-
-        参数:
-            buf: 包含 ZIP 文件内容的 BytesIO 对象。
-        """
-        try:
-            with zipfile.ZipFile(buf) as zf:
-                for name in zf.namelist():
-                    # 跳过 macOS 元数据和目录条目
-                    if name.startswith("__MACOSX") or name.endswith("/"):
-                        continue
-                    entry_data = zf.read(name)
-                    if name.endswith(".zip"):
-                        # 嵌套 zip → 递归
-                        extract_recursive(BytesIO(entry_data))
-                    elif name.endswith(".md"):
-                        basename = Path(name).name
-                        stem = Path(basename).stem
-                        if stem in processed_stems:
-                            skipped_processed.append(basename)
-                        elif stem in existing_input:
-                            skipped_existing.append(basename)
-                        else:
-                            dest = Path(INPUT_DIR) / basename
-                            dest.write_bytes(entry_data)
-                            new_files.append(basename)
-                            existing_input.add(stem)
-        except zipfile.BadZipFile:
-            pass  # 非 zip 文件，静默跳过
-
     try:
-        extract_recursive(BytesIO(f.read()))
-    except Exception as e:
-        return jsonify({"error": f"解压失败: {e}"}), 400
+        result = extract_zip_upload(
+            f.stream,
+            input_dir=Path(INPUT_DIR),
+            processed_stems=processed_stems,
+            existing_stems=existing_input,
+        )
+    except ZipUploadLimitError as exc:
+        return jsonify({"error": f"解压失败: {exc}"}), 413
+    except ZipUploadStorageError as exc:
+        return jsonify({"error": f"上传暂存或写入失败: {exc}"}), 507
+    except ZipUploadError as exc:
+        return jsonify({"error": f"解压失败: {exc}"}), 400
+    except OSError as exc:
+        return jsonify({"error": f"上传暂存或写入失败: {exc}"}), 507
 
-    if not new_files and not skipped_processed and not skipped_existing:
+    if not result.new_files and not result.skipped_processed and not result.skipped_existing:
         return jsonify({"error": "未在 zip 中找到任何 .md 文件（已递归搜索嵌套 zip）"}), 400
 
     return jsonify({
-        "new_files": new_files,
-        "skipped_processed": skipped_processed,
-        "skipped_existing": skipped_existing,
+        "new_files": result.new_files,
+        "skipped_processed": result.skipped_processed,
+        "skipped_existing": result.skipped_existing,
     })
 
 
@@ -566,6 +604,17 @@ def api_pipeline_settings():
 @admin_bp.route("/api/pipeline/preview", methods=["POST"])
 @admin_required
 def api_pipeline_preview():
+    try:
+        _pipeline_execution_gate.try_acquire()
+    except ExperimentBusyError:
+        return jsonify({"error": "Pipeline 正在运行中"}), 409
+    try:
+        return _api_pipeline_preview_exclusive()
+    finally:
+        _pipeline_execution_gate.release()
+
+
+def _api_pipeline_preview_exclusive():
     """同步处理待处理队列中的第一篇论文并返回结果预览。
 
     执行真实的论文处理流程：.md 文件会被移入 processed 目录，
@@ -615,21 +664,54 @@ def api_pipeline_preview():
     if verified_path.exists():
         try:
             verified_data = json.loads(verified_path.read_text(encoding="utf-8"))
+        except MemoryError:
+            raise
         except Exception:
             pass
 
-    return jsonify({
+    index_build = None
+    index_build_error = None
+    if result.get("status") == "processed" and verified_data is not None:
+        try:
+            index_build = _refresh_index(DATA_DIR, force=False)
+        except MemoryError:
+            raise
+        except Exception as exc:
+            index_build_error = f"{type(exc).__name__}: {exc}"
+
+    response = jsonify({
         "filename": filename,
         "status": result.get("status", "failed"),
         "verified_json": verified_data,
         "token_summary": tracker.get_summary(),
         "token_report": token_report,
+        "index_build": index_build,
+        "index_build_error": index_build_error,
     })
+    return (response, 503) if index_build_error else response
 
 
 @admin_bp.route("/api/pipeline/run", methods=["POST"])
 @admin_required
 def api_pipeline_run():
+    try:
+        _pipeline_execution_gate.try_acquire()
+    except ExperimentBusyError:
+        return jsonify({"error": "Pipeline 正在运行中"}), 409
+    gate_lease = {
+        "transferred": False,
+        # Capture the exact acquired instance. App factories or tests may
+        # reconfigure the module-level gate while this worker is alive.
+        "gate": _pipeline_execution_gate,
+    }
+    try:
+        return _api_pipeline_run_exclusive(gate_lease=gate_lease)
+    finally:
+        if not gate_lease["transferred"]:
+            gate_lease["gate"].release()
+
+
+def _api_pipeline_run_exclusive(*, gate_lease: dict[str, object] | None = None):
     """启动后台线程批量处理所有待处理的 Markdown 论文文件。
 
     使用 ThreadPoolExecutor 并行处理 input/ 目录中的所有 .md 文件。
@@ -755,7 +837,7 @@ def api_pipeline_run():
                 """单篇论文处理完成时的回调函数。
 
                 更新 pipeline 进度状态并通过 SSE 推送 paper_done 事件。
-                如果论文处理成功，立即增量更新 RAG 索引。
+                索引统一在批次结束后刷新，避免每篇论文重复加载整个语料。
 
                 参数:
                     filename: 已完成处理的文件名。
@@ -775,15 +857,6 @@ def api_pipeline_run():
                     "total": total,
                 }))
 
-                # 如果处理成功，立即增量更新索引（每篇论文实时更新）
-                if status == "success":
-                    try:
-                        _refresh_index(DATA_DIR, force=False)
-                    except Exception as e:
-                        # 索引更新失败不影响 Pipeline 继续运行
-                        # 会在 Pipeline 结束时重试
-                        print(f"⚠️  索引增量更新失败（将在结束时重试）: {e}")
-
             run_result = run_pipeline_batch(
                 todo_files,
                 input_dir=Path(INPUT_DIR),
@@ -792,13 +865,19 @@ def api_pipeline_run():
                 stop_requested=_stop_requested,
                 on_paper_start=_on_paper_start,
                 on_paper_done=_on_paper_done,
+                # The Admin UI only needs per-paper status and aggregate
+                # progress. Retaining every full verification report in the
+                # online Web process would grow for the entire corpus.
+                retain_reports=False,
             )
             stopped = run_result["stopped"]
-            # ── Pipeline 结束：确保索引同步（无论正常完成还是被停止）──────────
-            eq.put(("rebuilding_index", {}))
+            # ── Pipeline 结束：将索引任务交给独立受限 builder ─────────────
+            eq.put(("queueing_index", {}))
             try:
-                _refresh_index(DATA_DIR, force=False)
-                eq.put(("index_rebuilt", {}))
+                build_job = _refresh_index(DATA_DIR, force=False)
+                eq.put(("index_queued", {"job_id": build_job["job_id"]}))
+            except MemoryError:
+                raise
             except Exception as e:
                 eq.put(("index_error", {"error": str(e)}))
 
@@ -830,10 +909,24 @@ def api_pipeline_run():
             with _lock:
                 pipeline_state["running"] = False
                 pipeline_state["current_file"] = ""
+            if gate_lease is not None:
+                gate_lease["gate"].release()
 
     t = threading.Thread(target=run, daemon=True)
     pipeline_state["thread"] = t
-    t.start()
+    if gate_lease is not None:
+        # Mark ownership before start: a very short worker may finish before
+        # this WSGI thread resumes, but it still releases exactly once.
+        gate_lease["transferred"] = True
+    try:
+        t.start()
+    except BaseException:
+        if gate_lease is not None:
+            gate_lease["transferred"] = False
+        with _lock:
+            pipeline_state["running"] = False
+            pipeline_state["thread"] = None
+        raise
 
     msg = f"Pipeline 已启动，共 {len(todo_files)} 篇论文，{max_workers} 并行"
     if skipped > 0:
@@ -857,8 +950,8 @@ def api_pipeline_stream():
       - start: Pipeline 开始运行
       - processing: 开始处理某篇论文
       - paper_done: 某篇论文处理完成
-      - rebuilding_index: 正在重建 RAG 索引
-      - index_rebuilt: 索引重建成功
+      - queueing_index: 正在持久化索引构建任务
+      - index_queued: 独立 builder 已收到构建任务（尚未生效）
       - index_error: 索引重建失败
       - complete: 全部处理完成
       - stopped: 被用户停止
@@ -955,6 +1048,8 @@ def api_papers():
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             title = data.get("Title", "")
+        except MemoryError:
+            raise
         except Exception:
             pass
         papers.append({
@@ -1005,6 +1100,8 @@ def api_prompt_put():
     try:
         from nutrimaster.extraction.extract import _load_prompt
         _load_prompt.cache_clear()
+    except MemoryError:
+        raise
     except Exception:
         pass
     return jsonify({"message": "Prompt 已保存", "length": len(body["content"])})
@@ -1048,6 +1145,8 @@ def api_schema_put():
     try:
         from nutrimaster.extraction.extract import _load_extract_all_schema
         _load_extract_all_schema.cache_clear()
+    except MemoryError:
+        raise
     except Exception:
         pass
     return jsonify({"message": "Schema 已保存", "length": len(body["content"])})
@@ -1090,35 +1189,40 @@ def api_index_status():
     """
     from datetime import datetime
 
-    manifest_path = Path(SETTINGS.rag.index_dir) / "manifest.json"
     corpus_dir = Path(SETTINGS.rag.data_dir)
 
-    # 读取 manifest
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
-        indexed_files = len(manifest.get("files", {}))
-
-        # 获取最后修改时间
-        stat = os.stat(manifest_path)
-        last_updated = datetime.fromtimestamp(stat.st_mtime).isoformat()
-    else:
-        indexed_files = 0
-        last_updated = None
-
     # 统计 corpus 文件
-    all_files = list(corpus_dir.glob("*_nutri_plant_verified.json"))
+    all_files = list(corpus_dir.glob("*.json"))
     total_files = len(all_files)
-    missing_files = total_files - indexed_files
 
-    # 获取 chunks 信息
-    try:
-        from nutrimaster.rag.jina import JinaRetriever
-        retriever = JinaRetriever()
-        total_chunks = len(retriever.chunks)
-        embedding_shape = list(retriever.embeddings.shape) if retriever.embeddings is not None else None
-    except Exception:
+    # Reuse the one retriever owned by FastAPI. Constructing a diagnostic
+    # retriever here used to deserialize another corpus-sized chunks.pkl.
+    if _index_status_handler is not None:
+        status = _index_status_handler()
+        generation_id = status.get("generation_id")
+        total_chunks = int(status.get("chunks_loaded", 0))
+        embedding_shape = status.get("embedding_shape")
+        indexed_files = int(status.get("manifest_files") or 0)
+        generation_manifest = Path(str(status.get("index_dir", ""))) / "manifest.json"
+        if generation_manifest.is_file():
+            last_updated = datetime.fromtimestamp(
+                generation_manifest.stat().st_mtime
+            ).isoformat()
+        else:
+            last_updated = None
+    else:
         total_chunks = 0
         embedding_shape = None
+        indexed_files = 0
+        last_updated = None
+        generation_id = None
+    missing_files = max(0, total_files - indexed_files)
+
+    build_status = (
+        _index_build_status_handler()
+        if _index_build_status_handler is not None
+        else None
+    )
 
     return jsonify({
         "total_files": total_files,
@@ -1128,6 +1232,8 @@ def api_index_status():
         "embedding_shape": embedding_shape,
         "last_updated": last_updated,
         "is_synced": missing_files == 0,
+        "generation_id": generation_id,
+        "build": build_status,
     })
 
 
@@ -1136,7 +1242,8 @@ def api_index_status():
 def api_index_rebuild():
     """手动触发 RAG 索引重建。
 
-    支持增量或完全重建模式，可选择同步或异步执行。
+    支持增量或完全重建模式。构建始终由独立受限 builder 异步执行；
+    Web 进程不支持同步构建。
 
     请求体:
         {
@@ -1150,37 +1257,22 @@ def api_index_rebuild():
     body = request.get_json(silent=True) or {}
     force = body.get("force", False)
     async_mode = body.get("async", True)
-
-    if async_mode:
-        # 异步执行
-        def rebuild_task():
-            """后台线程任务：执行 RAG 索引重建并打印结果日志。"""
-            try:
-                _refresh_index(DATA_DIR, force=force)
-                print(f"✅ 索引重建完成（force={force}）")
-            except Exception as e:
-                print(f"❌ 索引重建失败: {e}")
-                import traceback
-                traceback.print_exc()
-
-        thread = threading.Thread(target=rebuild_task, daemon=True)
-        thread.start()
-
+    if not isinstance(force, bool) or not isinstance(async_mode, bool):
+        return jsonify({"error": "force 和 async 必须为布尔值"}), 400
+    if not async_mode:
         return jsonify({
-            "message": "索引重建已在后台启动",
-            "force": force,
-            "async": True,
-        })
-    else:
-        # 同步执行
-        try:
-            _refresh_index(DATA_DIR, force=force)
-            return jsonify({
-                "message": "索引重建完成",
-                "force": force,
-                "async": False,
-            })
-        except Exception as e:
-            return jsonify({
-                "error": f"索引重建失败: {e}"
-            }), 500
+            "error": "同步重建已禁用；索引只能由独立 builder 异步构建"
+        }), 400
+    try:
+        job = _refresh_index(DATA_DIR, force=force)
+    except MemoryError:
+        raise
+    except Exception as exc:
+        return jsonify({"error": f"索引构建任务提交失败: {exc}"}), 503
+    return jsonify({
+        "message": "索引构建任务已持久化排队；尚未构建或生效",
+        "status": "queued",
+        "job_id": job["job_id"],
+        "force": force,
+        "async": True,
+    }), 202

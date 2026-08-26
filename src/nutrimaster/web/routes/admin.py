@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
-from datetime import datetime
+import os
+import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
@@ -13,6 +14,17 @@ from nutrimaster.web.deps import WebServices, get_services
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _admin_json_upload_limit() -> int:
+    raw = os.getenv("NUTRIMASTER_ADMIN_JSON_MAX_BYTES", str(16 * 1024 * 1024))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("NUTRIMASTER_ADMIN_JSON_MAX_BYTES must be an integer") from exc
+    if not 1 <= value <= 50 * 1024 * 1024:
+        raise RuntimeError("NUTRIMASTER_ADMIN_JSON_MAX_BYTES must be between 1 byte and 50 MiB")
+    return value
 
 
 def _require_admin(user) -> None:
@@ -124,34 +136,6 @@ async def list_tools(user=Depends(get_current_user), services: WebServices = Dep
     return JSONResponse({"tools": services.registry.list_all()})
 
 
-def _background_reindex(services: WebServices) -> None:
-    """在后台线程中执行增量索引重建。
-
-    更新 reindex_state 的运行状态和进度信息。
-    成功后记录完成时间和当前索引块数；失败时记录错误信息。
-
-    参数:
-        services: Web 服务容器，包含检索器和索引状态。
-    """
-    state = services.reindex_state
-    try:
-        with state.lock:
-            state.running = True
-            state.progress = "开始增量重索引..."
-            state.error = None
-        services.refresh_index(force=False)
-        with state.lock:
-            state.running = False
-            state.progress = f"完成！当前索引: {len(services.retriever.chunks)} chunks"
-            state.last_completed = datetime.now().isoformat()
-    except Exception as exc:
-        logger.exception("[admin] reindex failed")
-        with state.lock:
-            state.running = False
-            state.error = str(exc)
-            state.progress = "重索引失败"
-
-
 @router.post("/api/admin/upload_data")
 async def admin_upload_data(
     file: UploadFile = File(...),
@@ -178,24 +162,59 @@ async def admin_upload_data(
     """
     _require_admin(user)
     filename = file.filename or ""
-    if not filename.endswith("_nutri_plant_verified.json"):
+    if (
+        not filename.endswith("_nutri_plant_verified.json")
+        or filename != Path(filename).name
+    ):
         raise HTTPException(status_code=400, detail="文件名必须以 _nutri_plant_verified.json 结尾")
     if services.settings.rag is None:
         raise HTTPException(status_code=500, detail="RAG 未配置")
     target_path = services.settings.rag.data_dir / filename
+    temporary_path = target_path.with_name(
+        f".{target_path.name}.{os.getpid()}.{uuid.uuid4().hex}.upload"
+    )
     try:
-        content = await file.read()
+        upload_limit = _admin_json_upload_limit()
+        content = await file.read(upload_limit + 1)
+        if len(content) > upload_limit:
+            raise HTTPException(status_code=413, detail="JSON 文件超过管理员上传大小限制")
         json.loads(content.decode("utf-8"))
-        target_path.write_bytes(content)
-    except json.JSONDecodeError as exc:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with temporary_path.open("xb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, target_path)
+        directory_fd = os.open(
+            target_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail="文件不是有效的 JSON 格式") from exc
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
-    state = services.reindex_state
-    with state.lock:
-        if state.running:
-            return JSONResponse({"status": "queued", "filename": filename})
-    threading.Thread(target=_background_reindex, args=(services,), daemon=True).start()
-    return JSONResponse({"status": "ok", "filename": filename})
+    try:
+        job = services.request_index_build(force=False, reason="verified-json-upload")
+    except Exception as exc:
+        logger.exception("[admin] failed to dispatch isolated index builder")
+        raise HTTPException(
+            status_code=503,
+            detail=f"文件已保存，但索引构建任务提交失败: {exc}",
+        ) from exc
+    return JSONResponse(
+        {
+            "status": "queued",
+            "filename": filename,
+            "job_id": job["job_id"],
+            "message": "文件已保存，索引任务已排队；尚未构建或生效",
+        },
+        status_code=202,
+    )
 
 
 @router.get("/api/admin/reindex_status")
@@ -216,17 +235,21 @@ async def admin_reindex_status(
         JSONResponse: 包含索引状态信息的 JSON 响应。
     """
     _require_admin(user)
-    state = services.reindex_state
     data_files_count = 0
     if services.settings.rag is not None:
         data_files_count = len(list(services.settings.rag.data_dir.glob("*_nutri_plant_verified.json")))
-    with state.lock:
-        payload = {
-            "running": state.running,
-            "progress": state.progress,
-            "error": state.error,
-            "last_completed": state.last_completed,
+    payload = services.index_build_status()
+    payload.update(
+        {
+            "running": payload.get("state") in {
+                "preflight",
+                "snapshotting",
+                "building",
+                "publishing",
+                "activating",
+            },
             "current_chunks": len(services.retriever.chunks),
             "data_files_count": data_files_count,
         }
+    )
     return JSONResponse(payload)

@@ -23,6 +23,7 @@ from nutrimaster.rag.evidence import EvidencePacket
 #       top_k: int = 10
 #       pubmed_query: str = ""
 #       gene_db_query: str = ""
+#       gene_db_keyword_spec: dict | list | str | None = None
 # RAGSearchService.search() 方法 (第48-79行):
 #   async def search(self, query: str, context: RAGSearchContext | None = None) -> EvidencePacket:
 #       context = context or RAGSearchContext()
@@ -91,6 +92,14 @@ class RagSearchTool(BaseTool):
                             "type": "string",
                             "description": "可选。本地基因库专用检索词；不填时使用 query。",
                         },
+                        "gene_db_keyword_spec": {
+                            "type": "object",
+                            "description": (
+                                "可选。Agent 生成的字段关键词检索规格，用于本地基因库精确补召回。"
+                                "格式为 {concepts:[{concept, query_weight, surface_forms:[{text, weight, match, requires_cohit}], "
+                                "target_fields:{SchemaField: field_weight}, concept_cap_multiplier}]}。"
+                            ),
+                        },
                         "mode": {
                             "type": "string",
                             "enum": ["normal", "deep"],
@@ -119,6 +128,7 @@ class RagSearchTool(BaseTool):
         query: str,
         pubmed_query: str = "",
         gene_db_query: str = "",
+        gene_db_keyword_spec: dict | list | str | None = None,
         mode: str = "normal",
         include_personal: bool = False,
         focus: str = "general",
@@ -135,6 +145,7 @@ class RagSearchTool(BaseTool):
             query: 本地基因库的语义检索词。
             pubmed_query: PubMed 专用英文检索式/关键词，为空时使用 query。
             gene_db_query: 本地基因库专用检索词，为空时使用 query。
+            gene_db_keyword_spec: 字段关键词检索规格，由 agent 根据 query 重点和 schema 重要性生成。
             mode: 检索模式，"normal" 或 "deep"（增加召回预算）。
             include_personal: 是否加入个人知识库检索。
             focus: 检索重点，如 gene_function、pathway、literature 等。
@@ -155,5 +166,6 @@ class RagSearchTool(BaseTool):
                 top_k=top_k,
                 pubmed_query=pubmed_query,
                 gene_db_query=gene_db_query,
+                gene_db_keyword_spec=gene_db_keyword_spec,
             ),
         )
